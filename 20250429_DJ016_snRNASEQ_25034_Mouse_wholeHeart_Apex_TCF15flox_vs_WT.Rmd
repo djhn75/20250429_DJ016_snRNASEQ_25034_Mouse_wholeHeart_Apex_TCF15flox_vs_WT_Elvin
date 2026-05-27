@@ -1,0 +1,1208 @@
+---
+title: "20250320_DJ11_Julian_24108_Mouse_VEGF"
+author: "David John"
+date: "2025-31-20"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# 0. Load essential libraries
+
+```{r}
+
+setwd(dirname(rstudioapi::getSourceEditorContext()$path))
+cfg<-config::get()
+getwd()
+Sys.getenv("")
+
+library(reticulate)
+use_python("/usr/bin/python3.12")
+#load libraries
+library(tidyverse)
+library(ggplot2)
+library(Seurat)
+library(openxlsx)
+library(DOtools)
+source(file.path(cfg$mount_point,"ZMM_shared/Bioinformatic/scRNA-SEQ-ZMM/Mariano_functions.R"))
+source(file.path(cfg$mount_point,"ZMM_shared/Bioinformatic/scRNA-SEQ-ZMM/Import10X-HelperFunctions_SeuratV5.R"))
+outputFolder <- file.path(cfg$mount_point,"Sequencing_Storage/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT_Elvin/")
+sink(file = file.path(outputFolder,"/analysis/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT.log"), append = TRUE, split = TRUE)
+```
+
+# 1. Preprocessing data 
+## 1.1 Prepare Paths for import count matrixes from cellbender outputs
+
+```{r}
+
+Sample_Paths <- c(paste0(outputFolder,"raw-data/cellbender/Tcf15mutant1/"),
+                  paste0(outputFolder,"raw-data/cellbender/Tcf15mutant2/"),
+                  paste0(outputFolder,"raw-data/cellbender/Tcf15mutant3"),
+                  paste0(outputFolder,"raw-data/cellbender/Wildtype1/"),
+                  paste0(outputFolder,"raw-data/cellbender/Wildtype2/"),
+                  paste0(outputFolder,"raw-data/cellbender/Wildtype3/")
+                  )
+
+
+
+
+Sample_Names <- c("Tcf15mutant-1","Tcf15mutant-2","Tcf15mutant-3","Wildtype-1", "Wildtype-2", "Wildtype-3")
+```
+
+## 1.2 Run Importer function
+
+```{r}
+#import data, create SeuratObjects
+resultList<-list()
+SeuratObjectList <- list()
+for (i in 1:length(Sample_Paths)) {
+  resultList<-Importer(pathway = Sample_Paths[i],
+                       id = Sample_Names[i],
+                       TenX = FALSE,
+                       CellBender = TRUE,
+                       FilterCells = TRUE,
+                       FilterByAbsoluteValues = TRUE,
+                       DeleteDoublets = TRUE,
+                       minFeatures=300, 
+                       maxFeatures=6000,
+                       minCounts=500,
+                       maxCounts=20000,
+                       performScaling = TRUE,
+                       maxMito=0.05) # warnings result from not specified layer in Vlnplot function, it still works correctly but annoying
+  print(resultList[[2]])
+  SeuratObjectList[[i]]<-resultList[[1]]
+}
+
+```
+
+## 1.3 Add disease information to the objects before integrating
+
+```{r}
+SeuratObject.anchors <- FindIntegrationAnchors(object.list = SeuratObjectList, dims = 1:20)
+SeuratObject.combined <- IntegrateData(anchorset = SeuratObject.anchors, dims = 1:20)
+```
+
+## 1.4 Integration with CCA method
+
+```{r}
+merged_obj <- Reduce(function(x, y) merge(x, y), SeuratObjectList) # get rid of the error prone approach
+
+merged_obj <- NormalizeData(merged_obj)
+merged_obj <- FindVariableFeatures(merged_obj)
+merged_obj <- ScaleData(merged_obj)
+merged_obj <- RunPCA(merged_obj)
+
+SeuratObject.combined <- IntegrateLayers(object = merged_obj, method = CCAIntegration, orig.reduction = "pca", new.reduction = "integrated.cca", verbose = T, )
+
+#re-join layers after integration
+SeuratObject.combined <- JoinLayers(SeuratObject.combined) # the individual scale layers remain after joining layers, remove them they are just unnecessary memory waste 
+layers_to_remove <- grep("^scale\\.data\\.", Layers(SeuratObject.combined), value = TRUE)
+SeuratObject.combined@assays$RNA@layers[layers_to_remove] <- NULL
+
+saveRDS(SeuratObject.combined, file = "/mnt/david/Sequencing_Storage/20250429_DJ016_snRNASEQ_25034_Mouse_Elvin_wholeHeart_Apex_TCF15flox_vs_WT/analysis/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT.rds")
+```
+
+# 2. Calculate neighbors, clusters and umap representation
+
+```{r}
+SeuratObject.combined <- FindNeighbors(object = SeuratObject.combined, reduction = "integrated.cca", dims = 1:10)
+SeuratObject.combined <- FindClusters(SeuratObject.combined, resolution = 0.6, algorithm=1, random.seed = 1234)
+SeuratObject.combined <- RunUMAP(object = SeuratObject.combined,
+                     reduction = "integrated.cca",
+                     dims = 1:10,
+                     spread = 1,
+                     min.dist = 0.3)
+
+
+
+p <- DimPlot(SeuratObject.combined, group.by = "seurat_clusters", label = T, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+
+ggsave(paste0(outputFolder, "analysis/plots/global/UMAPs/UMAP_seurat_cluster.pdf"), width = 8,height = 8, plot = p)
+
+SeuratObject.combined <- DO.CellTypist(SeuratObject.combined, runCelltypistUpdate=F)
+SeuratObject.combined$annotation <- SeuratObject.combined$predicted_labels_celltypist
+
+p <- DimPlot(SeuratObject.combined, group.by = "predicted_labels_celltypist", label = T, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+
+ggsave(paste0(outputFolder, "analysis/plots/global/UMAPs/UMAP_seurat_celltypes.pdf"), width = 8,height = 8, plot = p)
+
+saveRDS(SeuratObject.combined, file = "/mnt/david/Sequencing_Storage/20250429_DJ016_snRNASEQ_25034_Mouse_Elvin_wholeHeart_Apex_TCF15flox_vs_WT/analysis/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT.rds")
+
+SeuratObject.combined <- readRDS(file.path(cfg$mount_point,"Sequencing_Storage/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT_Elvin/analysis/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT.rds"))
+
+```
+
+## 2.1 Refine Annotation
+
+```{r}
+#Reclustering using FindSubCLuster in a loop
+SeuratObject.combined$seurat_Recluster <- as.vector(SeuratObject.combined$seurat_clusters)
+for (cluster in unique(SeuratObject.combined$seurat_clusters)) {
+  print(cluster)
+  SeuratObject.combined <- FindSubCluster(SeuratObject.combined,
+                            cluster = cluster,
+                            graph.name = "RNA_snn",
+                            algorithm = 4,
+                            resolution = 0.3)  
+  
+  cluster_cells <- rownames(SeuratObject.combined@meta.data)[SeuratObject.combined$seurat_clusters == cluster]
+  SeuratObject.combined$seurat_Recluster[cluster_cells] <- SeuratObject.combined$sub.cluster[cluster_cells]
+}
+warSeuratObject.combined$sub.cluster <- NULL
+
+#One Liner
+# SeuratObject <- Seu_miRNA
+# SeuratObject <- DO.FullRecluster(SeuratObject = SeuratObject,
+#                  res = 0.5,
+#                  algorithm = 4,
+#                  graph.name = "RNA_snn")
+
+p <- DimPlot(SeuratObject.combined, group.by = "seurat_Recluster", label = T, cols = rep(umap_colors,5), raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+
+ggsave(paste0(outputFolder, "analysis/plots/global/UMAPs/UMAP_seurat_Recluster.pdf"), width = 8,height = 8, plot = p)
+
+
+#re-run annotation
+SeuratObject.combined <- DO.CellTypist(SeuratObject.combined, over_clustering = "seurat_Recluster", runCelltypistUpdate=F)
+SeuratObject.combined$annotation_reclustered <- SeuratObject.combined$predicted_labels_celltypist
+p <- DimPlot(SeuratObject.combined, group.by = "annotation_reclustered", label = T, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+
+ggsave(paste0(outputFolder, "analysis/plots/global/UMAPs/UMAP_predicted_cell_annotation_reclustered.pdf"), width = 8,height = 8, plot = p)
+
+SeuratObject.combined$annotation_refined <- SeuratObject.combined$annotation_reclustered
+table(SeuratObject.combined$annotation_reclustered)
+
+SeuratObject.combined$annotation_refined <- plyr::revalue(SeuratObject.combined$annotation_reclustered,
+                                              c(
+                                                `B` = "B_cells",
+                                                `CD16+Mo` = "Ccr2+MP",
+                                                `CD4+T_naive` = "T_cells", # Cd4+ and Cd8+
+                                                `EC1_cap` = "Cap_EC",
+                                                `EC5_art` = "Art_EC",
+                                                `EC7_endocardial` = "End_EC",
+                                                `EC8_ln` = "Lym_EC",
+                                                `FB1` = "FB",
+                                                `FB2` = "FB",
+                                                `FB5` = "FB",
+                                                `FB4_activated` = "Act_FB",
+                                                `LYVE1+IGF1+MP` = "LYVE1+MP",
+                                                `Meso` = "Epic",
+                                                `NC1_glial` = "Neuro",
+                                                `NC2_glial_NGF+` = "PC",
+                                                `PC3_str` = "PC",
+                                                `SMC1_basic` = "SMC",
+                                                `vCM1` = "CM1",
+                                                `vCM4` = "CM2"))
+
+table(SeuratObject.combined$annotation_refined)
+
+p <- DimPlot(SeuratObject.combined, group.by = "annotation_refined", label = T, cols = umap_colors, raster = F) +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+
+ggsave(paste0(outputFolder, "analysis/plots/global/UMAPs/UMAP_Refined_cell_annotation.pdf"), width = 8,height = 8, plot = p)
+
+ saveRDS(SeuratObject.combined, file = "/mnt/david/Sequencing_Storage/20250429_DJ016_snRNASEQ_25034_Mouse_Elvin_wholeHeart_Apex_TCF15flox_vs_WT/analysis/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT.rds")
+
+SeuratObject.combined <- readRDS(file = "/Volumes/Sequencing_Storage/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT_Elvin/analysis/20250429_DJ016_snRNASEQ_25034_Mouse_wholeHeart_Apex_TCF15flox_vs_WT.rds")
+
+
+```
+
+## 2.2 UMAP per Condition
+
+```{r}
+p <- DimPlot(SeuratObject.combined, group.by = "annotation_refined", label = T, cols = umap_colors, raster = F, split.by = "condition") +
+    labs(x="UMAP1",y = "UMAP2")+
+    theme(plot.title = element_blank(),
+          # text = element_text(face = "bold",size = 20),
+          axis.title.x = element_text(size = 14, family="Helvetica"),
+          axis.title.y = element_text(size = 14, family="Helvetica"),
+          axis.text.x = element_blank(),
+          axis.text.y = element_blank(),
+          axis.ticks.x = element_blank(),
+          axis.ticks.y = element_blank(),
+          legend.position = "none",
+          legend.text = element_text(face = "bold"))
+ggsave(paste0(outputFolder, "analysis/plots/global/UMAPs/UMAP_Refined_cell_annotation_byCondition.pdf"), width = 8,height = 8, plot = p)
+```
+
+##2.3 Barplot of nuclei per sample
+```{r}
+# orig.ident is Seurat's default sample identifier
+# 1. Nuclei pro Sample zählen
+cell_counts <- SeuratObject.combined@meta.data %>%
+  group_by(orig.ident, condition) %>%
+  summarise(Nuclei = n(), .groups = "drop")
+
+# 2. Statistiken pro Condition berechnen
+stats <- cell_counts %>%
+  group_by(condition) %>%
+  summarise(
+    mean_nuclei = mean(Nuclei),
+    sd_nuclei   = sd(Nuclei),
+    .groups = "drop"
+  )
+
+#output raw values
+openxlsx::write.xlsx(cell_counts, file = file.path(outputFolder, "analysis/excels/qc_nuclei_per_condition.xlsx"))
+openxlsx::write.xlsx(stats, file = file.path(outputFolder, "analysis/excels/qc_nuclei_per_condition_average.xlsx"))
+
+# Set the desired order of conditions
+cell_counts$condition <- factor(cell_counts$condition, levels = c("Wildtype", "Tcf15mutant"))
+stats$condition       <- factor(stats$condition,       levels = c("Wildtype", "Tcf15mutant"))
+
+# 3. Plot
+ggplot() +
+  # Balken (Mittelwert)
+  geom_bar(data = stats,
+           aes(x = condition, y = mean_nuclei, fill = condition),
+           stat = "identity", width = 0.6) +
+  # Error Bars (SD)
+  geom_errorbar(data = stats,
+                aes(x = condition,
+                    ymin = mean_nuclei - sd_nuclei,
+                    ymax = mean_nuclei + sd_nuclei),
+                width = 0.2, linewidth = 0.8) +
+  # Einzelpunkte (jittered)
+  geom_jitter(data = cell_counts,
+              aes(x = condition, y = Nuclei),
+              width = 0.1, size = 2.5, shape = 21,
+              fill = "black", color = "black", stroke = 0.8) +
+  # Farben: beige & blau
+  scale_fill_manual(values = c("#F5F0DC", "#4472C4")) +
+  theme_classic() +
+  labs(title = "Nuclei per Condition",
+       x = "Condition",
+       y = "Number of Nuclei") +
+  theme(axis.text.x  = element_text(angle = 45, hjust = 1),
+        legend.position = "none", plot.title = element_text(hjust = 0.5))
+
+ggsave(filename = file.path(outputFolder, "analysis/plots/barplots/qc_nuclei_per_condition_barplot.svg"))
+```
+
+
+# 3. Define Markers for each cluster
+
+```{r}
+#Calculate Top expressed Markers for annotation
+Idents(SeuratObject.combined)<-"annotation_refined"
+SeuratObject.combined<-JoinLayers(SeuratObject.combined)
+annotation_Markers<- FindAllMarkers(object = SeuratObject.combined,
+                                    assay = "RNA",
+                                    group.by = "annotation_refined",
+                                    min.pct = 0.25,
+                                    logfc.threshold = 0.25)
+
+top_markers <- annotation_Markers %>%
+  dplyr::group_by(cluster) %>%
+  top_n(n = 5, wt = avg_log2FC)
+
+#kick MT-genes
+MT.genes <- top_markers[grep(pattern = "MT-", top_markers$gene),]
+top_markers <- top_markers[!(top_markers$gene %in% MT.genes$gene),]
+
+DO.Dotplot(object = SeuratObject.combined,
+           Feature = top_markers,
+           group.by.x = "annotation_refined",
+           plot.margin = c(1,1,1,1),
+           annotation_x = T, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = T,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3
+        )
+
+ggsave(paste0(outputFolder,"analysis/plots/dotplots/TopExpressed_genes_per_celltype.svg"), width = 19, height = 10)
+ggsave(paste0(outputFolder,"analysis/plots/dotplots/TopExpressed_genes_per_celltype.pdf"), width = 19, height = 10)
+
+```
+
+# 4. DEG analysis per cell type
+
+```{r}
+DEG_stats_collector <- list()
+table(SeuratObject.combined$condition)
+
+#Define Control and Disease condition
+ctrl.condition<-"Wildtype"
+dis.condition<-c("Tcf15mutant")
+for (dis in dis.condition) {
+  print(dis)
+ for (celltype in unique(SeuratObject.combined$annotation_refined)) {
+   print(celltype)
+   Seu_celltype <- subset(SeuratObject.combined, subset = annotation_refined == celltype) # for DEG analysis the normal subset function should still work
+  
+  DEG_stats <- FindMarkers(object = Seu_celltype,
+                           ident.1 = dis,
+                           ident.2 = ctrl.condition,
+                           min.pct = 0.01,
+                           logfc.threshold = 0.1,
+                           assay = "RNA",
+                           only.pos = F,
+                           test.use = "wilcox",
+                           group.by = "condition")
+  DEG_stats <- rownames_to_column(DEG_stats)
+  DEG_stats[["condition"]] <- dis
+  DEG_stats[["celltype"]] <- celltype
+  
+  DEG_stats_collector <- rbind(DEG_stats_collector, DEG_stats)     
+  
+ }
+}
+
+write.xlsx(DEG_stats_collector, file = paste0(outputFolder, "analysis/excels/DEG_analysis_nothresh_TCF15_vs_WT.xlsx"))
+```
+
+## 4.1 Dotplots per Celltype
+
+```{r}
+top_markers <- DEG_stats_collector %>%
+  dplyr::group_by(celltype) %>%
+  top_n(n = 5, wt = abs(avg_log2FC))
+
+top_markers <- DEG_stats_collector %>%
+  arrange(desc(abs(avg_log2FC))) %>%              
+  distinct(rowname, .keep_all = TRUE) %>%       
+  group_by(celltype) %>%
+  slice_head(n = 5) 
+
+top_markers %>% rename(rowname="gene", celltype="cluster") -> top_markers
+
+
+
+#kick MT-genes
+MT.genes <- top_markers[grep(pattern = "MT-", top_markers$gene),]
+top_markers <- top_markers[!(top_markers$gene %in% MT.genes$gene),]
+
+library(openxlsx)
+write.xlsx(top_markers, file = paste0(outputFolder, "analysis/excels/DEG_analysis_top20_DEGs_perCelltype_by_log2FC_TCF15_vs_WT.xlsx"))
+
+
+top_markers_uniq<- top_markers %>% distinct(gene, .keep_all = FALSE)
+DO.Dotplot(SeuratObject.combined, Feature = top_markers, group.by.x = "condition", annotation_x = TRUE, segWidth=0.3, hjust=0.5, vjust=0, lwd=3)
+ggsave(paste0(outputFolder,"analysis/plots/global/dotplots/Top5Expressed_genes_TCF15_vs_WT.pdf"), width = 19, height = 10)
+
+celltypes<-unique(SeuratObject.combined$annotation_refined)
+for (celltype in unique(SeuratObject.combined$annotation_refined)) {
+   print(celltype)
+
+  df.tmp<-top_markers[top_markers$cluster==celltype,]  
+   
+}
+
+
+
+DO.Dotplot(SeuratObject.combined, Feature = top_markers, group.by.x = "condition")
+DoHeatmap(SeuratObject.combined, features = top_markers$gene, group.by = "condition")
+```
+
+## 4.2 Plot TCF15 Expression
+
+```{r}
+library(DOtools)
+table(SeuratObject.combined$condition)
+p<-DO.BarplotWilcox(Seu_object = SeuratObject.combined, Feature = "Tcf15", ctrl.condition = "Wildtype")
+ggsave(filename = paste0(outputFolder, "analysis/plots/global/vlnplots/Barplot_Tcf15_global.pdf"), width = 5, height = 5, plot = p, device = "pdf")
+
+```
+
+```{r}
+FeaturePlot(SeuratObject.combined, features = "Tcf15", label = T, label.size = 4, cols = c("grey", "red"), pt.size = 3, min.cutoff = 1, max.cutoff = 2)
+ggsave(filename = paste0(outputFolder, "analysis/plots/global/UMAPs/FeaturePlot_Tcf15_global.pdf"), width = 5, height = 5,  device = "pdf")
+```
+
+#### 4.3 Claculate Mesenchmyal score
+
+```{r}
+mesenchymal_genes_for_score<-list(mesenchymal=c("Mmp14","Fn1","Postn","Eln","Col1a1","Col1a2","Mgp","Col3a1","Bgn","Dcn","Serpine1","Mmp9","Snai1","Egfl7"))
+SeuratObject.combined<-AddModuleScore(object = SeuratObject.combined, features = mesenchymal_genes_for_score, name = "mesenchymal_score")
+
+FeaturePlot(SeuratObject.combined, features = "mesenchymal_score1", label = T, label.size = 4, split.by = "condition")
+ggsave(filename = paste0(outputFolder, "analysis/plots/global/UMAPs/FeaturePlot_MesenchymalScore_global.pdf"), width = 8, height = 5,  device = "pdf")
+DO.BarplotWilcox(SeuratObject.combined, Feature = "mesenchymal_score1", ctrl.condition = "Wildtype")
+ggsave(filename = paste0(outputFolder, "analysis/plots/global/vlnplots/Barplot_MesenchymalScore_global_wilcox.pdf"), width = 5, height = 5,  device = "pdf")
+```
+
+# 5  Cell compositions
+
+## 5.1 stacked Barplot
+
+```{r}
+# get information of cell type number of object
+barplot.DF <- SeuratObject.combined@meta.data %>%
+  group_by(cell.type = annotation_refined, condition) %>%
+  summarise(value = n(), .groups = "drop")
+
+barplot.DF$condition <- factor(barplot.DF$condition)
+
+# Convert to a contingency table
+contingency_table <- pivot_wider(
+  data = barplot.DF, 
+  names_from = condition, 
+  values_from = value,
+  values_fill = 0
+) %>% 
+  column_to_rownames("cell.type")
+
+write.xlsx(contingency_table, paste0(outputFolder,"analysis/excels/Cell_compositions_numbers_perCondition.xlsx"), rowNames=T)
+
+chisq_result <- chisq.test(contingency_table)
+p_value <- signif(chisq_result$p.value, digits = 3) 
+p_value <- signif(ifelse(p_value == 0, .Machine$double.xmin, p_value),digits = 3) 
+
+ggplot(barplot.DF, aes(fill=cell.type, y=value,x=condition))+
+  geom_bar(position = "fill", stat= "identity")+
+  scale_fill_manual(values = umap_colors
+                      , name = "Cell type")+
+  labs(title = "", y = "Cell composition (in %)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(color = "black",angle = 0, size = 16),
+        axis.text.y = element_text(color = "black", size = 16),
+        axis.title.x = element_blank(),
+        axis.title = element_text(size = 16, color = "black"),
+        plot.title = element_text(size = 16, hjust = 0.5),
+        axis.line = element_line(color = "black"),
+        strip.text.x = element_text(size = 16, color = "black"),
+        legend.position = "right") 
+  annotate("text", x = 1.5, y = 1.05, label = paste("p =", p_value), size = 6, color = "black")
+
+ggsave(paste0(outputFolder, "analysis/plots/barplots/Stacked_bar_plot_cell_composition.pdf"), width = 5, height = 5)
+```
+
+## 5.2 Barplot per sample
+
+```{r}
+p<-BarplotPercentages(SeuratObject = SeuratObject.combined, split.by = "orig.ident", group.by = "annotation_refined", color.by = "condition")
+ggsave(filename = paste0(outputFolder, "analysis/plots/barplots/Barplot_cell_composition_per_celltype_sample.pdf"), plot =p, device = "pdf",  width = 10, height = 10)
+```
+
+##5.1 stacked Barplot
+
+```{r}
+# get information of cell type number of object
+barplot.DF <- SeuratObject.combined@meta.data %>%
+  group_by(cell.type = annotation_refined, orig.ident) %>%
+  summarise(value = n(), .groups = "drop")
+
+barplot.DF$orig.ident <- factor(barplot.DF$orig.ident)
+
+# Convert to a contingency table
+contingency_table <- pivot_wider(
+  data = barplot.DF, 
+  names_from = orig.ident, 
+  values_from = value,
+  values_fill = 0
+) %>% 
+  column_to_rownames("cell.type")
+
+write.xlsx(contingency_table, paste0(outputFolder,"analysis/excels/Cell_compositions_numbers_by_orig.ident.xlsx"), rowNames=T)
+
+chisq_result <- chisq.test(contingency_table)
+p_value <- signif(chisq_result$p.value, digits = 3) 
+p_value <- signif(ifelse(p_value == 0, .Machine$double.xmin, p_value),digits = 3) 
+
+ggplot(barplot.DF, aes(fill=cell.type, y=value,x=orig.ident))+
+  geom_bar(position = "fill", stat= "identity")+
+  scale_fill_manual(values = umap_colors
+                      , name = "Cell type")+
+  labs(title = "", y = "Cell composition (in %)") +
+  theme_classic() +
+  theme(axis.text.x = element_text(color = "black",angle = 45, size = 16, hjust = 0.9, vjust = 0.9),
+        axis.text.y = element_text(color = "black", size = 16),
+        axis.title.x = element_blank(),
+        axis.title = element_text(size = 16, color = "black"),
+        plot.title = element_text(size = 16, hjust = 0.5),
+        axis.line = element_line(color = "black"),
+        strip.text.x = element_text(size = 16, color = "black"),
+        legend.position = "right") 
+  #annotate("text", x = 1.5, y = 1.05, label = paste("p =", p_value), size = 6, color = "black")
+
+ggsave(paste0(outputFolder, "analysis/plots/barplots/Stacked_bar_plot_cell_composition_orig_ident.pdf"), width = 5, height = 5)
+```
+
+```{r}
+p<-DO.Vln.Plot.wilcox(SeuratObject.combined, SeuV5 = T, Feature = "Tcf15", ctrl.condition = "Wildtype", group.by = "condition")
+ggsave(filename = paste0(outputFolder, "analysis/plots/vlnplotsVLNPlot_Tcf15_global.pdf"), width = 5, height = 5, plot = p, device = "pdf")
+
+```
+
+# 6. Celltype specific Analyis 
+## 6.1vCM1 (renamed to CM1)
+
+```{r}
+Seu.CM<-subset(SeuratObject.combined, subset = annotation_refined == "CM1")
+```
+
+```{r}
+DO.Vln.Plot.wilcox(Seu.CM, SeuV5 = T, Feature = "TCF15", ctrl.condition = "Wildtype", group.by = "condition")
+ggsave(paste0(outputFolder, "analysis/plots/VLNPlot_TCF15_CM1.pdf"), width = 5, height = 5)
+
+```
+
+## 6.2 Endothelial cells 
+### 6.2.1 All Ecs
+
+```{r}
+table(SeuratObject.combined$annotation_refined)
+Seu.EC_all<-subset(SeuratObject.combined, subset = annotation_refined %in% c("Cap_EC", "Art_EC", "EC6_ven", "End_EC"))
+DO.Dotplot(Seu_object = Seu.EC_all,
+           Feature = c("Serpine1","Egfl7","Pecam1", "Twist1", "Snai1"),
+           group.by.x = "condition",
+           plot.margin = c(1,1,1,1),
+           annotation_x = F, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = F,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3
+        )
+
+DO.Barplot(Seu.EC_all, Feature = "Meox2", ctrl.condition = "Wildtype", group.by = )
+
+.logger<-DOtools:::.logger
+genes<-c("Serpine1","Egfl7","Pecam1", "Twist1", "Snai1")
+for (gene in genes) {
+  DO.Vln.Plot.wilcox(Seu.EC_all, SeuV5 = T, Feature = gene, ctrl.condition = "Wildtype", group.by = "condition")
+  
+  filename<-paste0()
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/VLNPlot_",gene,"_EC_all.pdf"), width = 5, height = 5)
+}
+
+for (gene in genes) {
+  DO.Mean.SEM.Graphs.cluster.t(Seu.EC_all, Feature = gene, ctrl.condition = "Wildtype", group.by = "condition")
+  filename<-paste0()
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/Mean.SEM.cluster.tTest_",gene,"_EC_all.pdf"), width = 5, height = 5)
+  
+  DO.Mean.SEM.Graphs.wilcox(Seu.EC_all, Feature = gene, ctrl.condition = "Wildtype", group.by = "condition")
+  filename<-paste0()
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/Mean.SEM.wilcoxon_",gene,"_EC_all.pdf"), width = 5, height = 5)
+}
+
+```
+
+
+### 6.2.2 Plot transporter genes in EC subtypes ()
+```{r}
+DO.Dotplot(object = Seu.EC_all,
+           Feature = c("Cd36","Slc2a1","Cav1", "Insr"),
+           group.by.x = "condition",
+           group.by.y = "annotation_refined",
+           plot.margin = c(1,1,1,1),
+           annotation_x = F, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = F,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3, across.group.by.x = "condition"
+          
+           
+        )
+
+
+genes<- c("Cd36","Slc2a1","Cav1", "Insr")
+for (gene in genes){
+  p<- DO.BarplotClustert(Seu.EC_all, Feature = gene, ctrl.condition = "Wildtype")
+  p<- ggpubr::annotate_figure(p, bottom = "p-value= t-test clustered over samples")
+
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/BarPlot_",gene,"clustered_t_test_EC_all.pdf"), width = 5, height = 5)
+  
+}
+
+for (celltype in unique(Seu.EC_all$annotation_refined)) {
+  for (gene in genes){
+    sub <- subset(Seu.EC_all, subset = annotation_refined == celltype)
+    p<- DO.BarplotClustert(sub, Feature = gene, ctrl.condition = "Wildtype")
+    p<- ggpubr::annotate_figure(p, top = celltype, bottom = "p-value= t-test clustered over samples")
+    ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/BarPlot_",celltype,"_",gene,"_clustered_t_test_EC_all.pdf"), width = 5, height = 5)
+  }
+}
+p<- DO.BarplotClustert(Seu.EC_all, Feature = "Cav1", ctrl.condition = "Art_EC", group.by = "annotation_refined",  )
+
+```
+
+
+```{r}
+genes<- c("Meox2")
+
+for (celltype in unique(Seu.EC_all$annotation_refined)) {
+  for (gene in genes){
+    sub <- subset(Seu.EC_all, subset = annotation_refined == celltype)
+    p<- DO.BarplotClustert(sub, Feature = gene, ctrl.condition = "Wildtype")
+    p<- ggpubr::annotate_figure(p, top = celltype, bottom = "p-value= t-test clustered over samples")
+    ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/BarPlot_",celltype,"_",gene,"_clustered_t_test_EC_all.pdf"), width = 5, height = 5)
+  }
+}
+
+```
+
+
+#### 6.2.1.1 Plot Mesenchymal genes and Score
+
+```{r}
+mesenchymal_genes1<-c("Fn1","Eln","Mgp","Bgn","Mmp14", "Dcn","Col3a1")
+mesenchymal_genes2<-c("Serpine1","Mmp9","Snai1", "Postn","Col1a1","Col1a2")
+
+vascular_genes<-c("Pecam1","Kdr","Ptprb","Spry1","Foxo1","S1pr1","Efna1","Gja4","Cxcr4","Ace","Tgfbr2","Irp5")
+
+#rename Wildtype to Ctrl, so that it apperas first in the dotplot
+Seu.EC_all$condition2<- ifelse(Seu.EC_all$condition=="Wildtype", yes = "Ctrl", no = "Tcf15mutat")
+
+
+p<- DO.Dotplot(Seu_object = Seu.EC_all,
+           Feature = mesenchymal_genes1,
+           group.by.x = "condition2",
+           group.by.y = "annotation_refined",
+           plot.margin = c(1,1,1,1),
+           annotation_x = F, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = F,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3, scale_gene = TRUE,
+        ) + ggtitle("Mesenchymal Genes in ECs")
+
+ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/dotplot_mesenchymalmarkers_ec_all_1.pdf"), width = 10, height = 4)
+
+p<- DO.Dotplot(Seu_object = Seu.EC_all,
+           Feature = mesenchymal_genes2,
+           group.by.x = "annotation_refined",
+           group.by.y = "condition2",
+           plot.margin = c(1,1,1,1),
+           annotation_x = F, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = F,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3, scale_gene = TRUE,
+        ) + ggtitle("Mesenchymal Genes in ECs")
+
+ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/dotplot_mesenchymalmarkers_ec_all_2.pdf"), width = 10, height = 4)
+
+ p<- DO.Dotplot(Seu_object = Seu.EC_all,
+           Feature = vascular_genes,
+           group.by.x = "annotation_refined",
+           group.by.y = "condition",
+           plot.margin = c(1,1,1,1),
+           annotation_x = F, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = F,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3, 
+        ) + ggtitle("Vascular Genes in ECs")
+
+ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/dotplot_vascularmarkers_ec_all.pdf"), width = 15, height = 10)
+```
+
+#### 6.2.1.2  Plot EC subtypes separately (Fig 3e (Final))
+```{r}
+library(ggpubr)
+SeuratObject.combined$condition2<- ifelse(SeuratObject.combined$condition=="Wildtype", yes = "Ctrl", no = "Tcf15mutat")
+mesenchymal_genes1<-c("Fn1","Eln","Mgp","Bgn","Mmp14","Dcn","Col3a1")
+mesenchymal_genes2<-c("Serpine1","Mmp9","Snai1","Postn","Col1a1","Col1a2")
+
+for (celltype in c("Cap_EC", "Art_EC", "EC6_ven", "End_EC")) {
+  Seu.EC_temp <-subset(SeuratObject.combined, subset= annotation_refined == celltype)
+
+
+  #p1<- DO.Dotplot(Seu_object = Seu.EC_temp, Feature = mesenchymal_genes1, group.by.x = "condition2") + ggtitle(paste("Mesenchymal Genes in ", celltype)) + coord_flip()
+   # ggsave(paste0(outputFolder, "analysis/plots/for-paper/Fig3e/dotplot_mesenchymal_genes1_", celltype, "_.pdf"), width = 5, height = 7)
+
+  
+  p2<- DO.Dotplot(Seu_object = Seu.EC_temp, Feature = mesenchymal_genes2, group.by.x = "condition2") + coord_flip()
+    ggsave(paste0(outputFolder, "analysis/plots/for-paper/Fig3e/dotplot_mesenchymal_genes2_", celltype, "_.pdf"), width = 5, height = 7)
+
+} 
+```
+
+
+
+#### 6.2.1.2 Claculate Mesenchmyal score
+
+```{r}
+mesenchymal_genes_for_score<-list(mesenchymal=c("Mmp14","Fn1","Postn","Eln","Col1a1","Col1a2","Mgp","Col3a1","Bgn","Dcn","Serpine1","Mmp9","Snai1","Egfl7"))
+Seu.EC_all<-AddModuleScore(object = Seu.EC_all, features = mesenchymal_genes_for_score, name = "mesenchymal_score")
+
+FeaturePlot(Seu.EC_all, features = "mesenchymal_score1", label = T, label.size = 4, split.by = "condition")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/FeaturePlot_MesenchymalScore_ec_all.pdf"), width = 8, height = 5,  device = "pdf")
+DO.BarplotWilcox(Seu.EC_all, Feature = "mesenchymal_score1", ctrl.condition = "Wildtype")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/vlnplots/Barplot_MesenchymalScore_ec_all_wilcox.pdf"), width = 5, height = 5,  device = "pdf")
+```
+
+#### 6.2.1.3 Split cells based on Mesenchmyal score
+```{r}
+Seu.EC_all$mesenchymal_group <- ifelse(Seu.EC_all$mesenchymal_score1 > 0, "High", "Low")
+p<-DO.CellComposition(Seu.EC_all, cluster_column = "mesenchymal_group", sample_column = "orig.ident", sort_x = c("Wildtype", "Tcf15mutant"))
+p<- ggpubr::annotate_figure(p, bottom = "Mesenchymal Score > 0 = High; Mesenchymal Score < 0 = Low")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/Barplot_CellComposiotion_MesenchymalGroup_ec_all_combined.pdf"), width = 5, height = 5,  device = "pdf")
+
+
+#for individual celltypes
+Seu.EC_all$condition_mesenchymal_group<- paste(Seu.EC_all$condition, Seu.EC_all$mesenchymal_group, sep = "_")
+p<-DO.CellComposition(Seu.EC_all, cluster_column = "annotation",condition_column = "condition_mesenchymal_group", sample_column = "orig.ident")
+p<- ggpubr::annotate_figure(p, bottom = "Mesenchymal Score > 0 = High; Mesenchymal Score < 0 = Low")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/Barplot_CellComposiotion_MesenchymalGroup_ec_all.pdf"), width = 10, height =4,  device = "pdf")
+
+```
+
+
+### 6.2.2 Capilary ECs
+```{r}
+table(SeuratObject.combined$annotation_refined)
+Seu.EC_cap<-subset(SeuratObject.combined, subset = annotation_refined == "Cap_EC")
+
+genes<-c("Serpine1","Egfl7","Pecam1", "Twist1", "Snai1")
+for (gene in genes) {
+  DO.Vln.Plot.wilcox(Seu.EC_cap, SeuV5 = T, Feature = gene, ctrl.condition = "Wildtype", group.by = "condition")
+    filename<-paste0()
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_cap/VLNPlot_",gene,"_EC_cap.pdf"), width = 5, height = 5)
+  
+  DO.Mean.SEM.Graphs.cluster.t(Seu.EC_cap, Feature = gene, ctrl.condition = "Wildtype", group.by = "condition")
+  filename<-paste0()
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_cap/Mean.SEM.cluster.tTest_",gene,"_EC_cap.pdf"), width = 5, height = 5)
+  
+  DO.Mean.SEM.Graphs.wilcox(Seu.EC_cap, Feature = gene, ctrl.condition = "Wildtype", group.by = "condition")
+  filename<-paste0()
+  ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_cap/Mean.SEM.wilcoxon_",gene,"_EC_cap.pdf"), width = 5, height = 5)
+}
+
+
+```
+
+```{r}
+mesenchymal_genes<-c("Mmp14","Fn1","Postn","Eln","Vin","Col1a1","Col1a2","Mgp","Col3a1","Bgn","Dcn","Tnc","Serpine1","Mmp9","Snai1","Snai2","Twist1","Zeb2","Il6","Pdgfra")
+
+vascular_genes<-c("Pecam1","Kdr","Ptprb","Spry1","Foxo1","S1pr1","Efna1","Gja4","Cxcr4","Ace","Tgfbr2","Irp5")
+
+
+p<- DO.Dotplot(Seu_object = Seu.EC_cap,
+           Feature = mesenchymal_genes,
+           group.by.x = "condition",
+           plot.margin = c(1,1,1,1),
+           annotation_x = F, # only useable if Feature is a dataframe with cluster information, e.g. FindAllMakers output (you need a column with cluster)
+           point_stroke=0.1,
+           annotation_x_rev = F,
+           textSize = 14,
+           hjust = 0.5,
+           vjust = 0,
+           textRot = 0,
+           segWidth = 0.3,
+           lwd = 3
+        ) + ggtitle("Mesenchymal Genes in cap ECs")
+
+ggsave(paste0(outputFolder, "analysis/plots/celltype/EC_all/dotplot_mesenchymalmarkers_ec_all.pdf"), width = 10, height = 5)
+
+```
+
+
+
+
+
+# 7. CellChat analysis
+
+## 7.1 Create CellChat object for Empty
+
+```{r}
+library(CellChat)
+library(patchwork)
+
+Seu_Tcf15 <- subset(SeuratObject.combined, subset = condition =="Tcf15mutant")
+
+#CellChat assumes a column called samples with orig.ident information
+Seu_Tcf15$samples <- Seu_Tcf15$orig.ident
+Seu_Tcf15$samples <- factor(Seu_Tcf15$samples)
+
+CC_Tcf15 <- createCellChat(Seu_Tcf15,
+                           group.by = "annotation_refined",
+                           assay = "RNA")
+
+#Initialize CellchatDB
+CellChatDB <- CellChatDB.mouse
+CC_Tcf15@DB <- CellChatDB
+
+CC_Tcf15 <- subsetData(CC_Tcf15)
+CC_Tcf15 <- identifyOverExpressedGenes(CC_Tcf15)
+CC_Tcf15 <- identifyOverExpressedInteractions(CC_Tcf15)
+
+#Try their projection approach to reduce dropout effects
+CC_Tcf15 <- CellChat::smoothData(CC_Tcf15, adj = PPI.mouse)
+
+#Comunication propability
+CC_Tcf15 <- computeCommunProb(CC_Tcf15, population.size = T) # I will set this parameter to true since population sizes differ a lot
+CC_Tcf15 <- computeCommunProbPathway(CC_Tcf15)
+
+#Aggregated cell-cell communication
+CC_Tcf15 <- aggregateNet(CC_Tcf15)
+CC_Tcf15 <- netAnalysis_computeCentrality(CC_Tcf15)
+
+```
+
+## 7.2 Create CellChat object for ctrl
+
+```{r}
+Seu_Wildtype <- subset(SeuratObject.combined, subset = condition =="Wildtype")
+
+#CellChat assumes a column called samples with orig.ident information
+Seu_Wildtype$samples <- Seu_Wildtype$orig.ident
+Seu_Wildtype$samples <- factor(Seu_Wildtype$samples)
+
+CC_Wildtype <- createCellChat(Seu_Wildtype,
+                           group.by = "annotation_refined",
+                           assay = "RNA")
+
+#Initialize CellchatDB
+CellChatDB <- CellChatDB.mouse
+CC_Wildtype@DB <- CellChatDB
+
+CC_Wildtype <- subsetData(CC_Wildtype)
+CC_Wildtype <- identifyOverExpressedGenes(CC_Wildtype)
+CC_Wildtype <- identifyOverExpressedInteractions(CC_Wildtype)
+
+#Try their projection approach to reduce dropout effects
+CC_Wildtype <- CellChat::smoothData(CC_Wildtype, adj = PPI.mouse)
+
+#Communication propability
+CC_Wildtype <- computeCommunProb(CC_Wildtype, population.size = T) # I will set this parameter to true since population sizes differ a lot
+CC_Wildtype <- computeCommunProbPathway(CC_Wildtype)
+
+#Aggregated cell-cell communication
+CC_Wildtype <- aggregateNet(CC_Wildtype)
+CC_Wildtype <- netAnalysis_computeCentrality(CC_Wildtype)
+```
+
+## 7.3 Combined CellChat analysis
+
+```{r}
+#Continue with merging this object with the ctrl
+CC_list <- list(wt = CC_Wildtype, tcf15 = CC_Tcf15)
+CC_merge <- mergeCellChat(CC_list, add.names = names(CC_list))
+
+saveRDS(CC_merge, file = paste0(outputFolder, "analysis/cellchat/TCF15_CC.rds"))
+CC_merge <- readRDS(file = paste0(outputFolder, "analysis/cellchat/TCF15_CC.rds"))
+
+
+pdf(paste0(outputFolder, "analysis/cellchat/InteractionNumber_all.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          # sources.use = 12,
+                          title.name = "Outgoing Interaction All",
+                          arrow.width = 1,
+                          arrow.size = .5)
+dev.off()
+
+pdf(paste0(outputFolder, "analysis/cellchat/InteractionWeigth_all.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          # sources.use = 12,
+                          title.name = "Interaction weight All",
+                          arrow.width = 1,
+                          arrow.size = .5,
+                          measure = "weight")
+dev.off()
+
+
+#Number of interactions, weight
+gg1 <- compareInteractions(CC_merge, show.legend = F, group = c(1,2), color.use = DOtools:::umap_colors)
+gg2 <- compareInteractions(CC_merge, show.legend = F, group = c(1,2), measure = "weight", color.use = DOtools:::umap_colors)
+gg1+gg2
+ggsave(paste0(outputFolder, "analysis/cellchat/CompareInteractions_bar_plot.pdf"), width = 5, height = 3)
+
+
+ #number of interaction per cell type
+pdf(paste0(outputFolder, "analysis/cellchat/CompareInteractions_circ.pdf"), width = 14, height = 7)
+par(mfrow = c(1,2), xpd=TRUE)
+gg1 <- netVisual_diffInteraction(CC_merge, weight.scale = T, arrow.size = 0.05)
+gg2 <- netVisual_diffInteraction(CC_merge, weight.scale = T, arrow.size = 0.05, measure = "weight")
+dev.off()
+
+#as heatmap
+pdf(paste0(outputFolder, "analysis/cellchat/CompareInteractions_heatmap.pdf"), width = 8, height = 5)
+par(mfrow = c(1,2), xpd=TRUE)
+gg1 <- netVisual_heatmap(CC_merge)
+gg2 <- netVisual_heatmap(CC_merge, measure = "weight")
+gg1+gg2
+dev.off()
+
+#Identify up and downregulated signaling ligand-receptor pairs 
+#sources 
+levels(CC_merge@idents$joint)
+for (src_name in levels(CC_merge@idents$joint)) {
+  target_names <- paste(levels(CC_merge@idents$joint)[levels(CC_merge@idents$joint) != src_name], collapse = "-")
+  print(src_name)
+  p <- netVisual_bubble(CC_merge,
+                   sources.use = grep(src_name,levels(CC_merge@idents$joint), fixed = T),
+                   targets.use = which(levels(CC_merge@idents$joint) != src_name),
+                   comparison = c(1,2),
+                   angle.x = 45,
+                   color.text = DOtools:::umap_colors)
+  
+  build_p <- ggplot_build(p)
+  plot_names <- build_p$layout$panel_params[[1]]$y$get_labels()
+  plot_names <- plot_names[!grepl("Ptprm  - Ptprm",plot_names)]
+  
+  pairLR_all <- CellChatDB.mouse$interaction
+  pairLR_use <- pairLR_all[pairLR_all$interaction_name_2 %in% plot_names,]$pathway_name
+
+  netVisual_bubble(CC_merge,
+                   sources.use = grep(src_name,levels(CC_merge@idents$joint), fixed = T),
+                   targets.use = which(levels(CC_merge@idents$joint) != src_name),
+                   comparison = c(1,2),
+                   angle.x = 45,
+                   color.text = DOtools:::umap_colors,
+                   signaling = pairLR_use)
+  
+ ggsave(paste0(outputFolder, "analysis/cellchat/LigandReceptor_analysis_",src_name,"_to_others.pdf"), width = 10, height = 17) 
+ 
+}
+
+for (src_name in levels(CC_merge@idents$joint)) {
+  #create incoming-outgoing scatter plot with defined ident between conditions
+  gg1 <- netAnalysis_signalingChanges_scatter(CC_merge,
+                                              idents.use = src_name,
+                                              color.use = DOtools:::umap_colors,
+                                              top.label = 1,
+                                              signaling.exclude = c("COLLAGEN","LAMININ","PTPRM","PECAM1"),
+                                              comparison = c(1,2))
+  gg1 <- gg1+
+    DOtools:::theme_box()+
+    labs(title = paste0("Signaling changes upon miRNAko in ", src_name))+
+    theme(axis.text.x = element_text(color = "black",angle = 0,hjust = 1, size = 14),
+            axis.text.y = element_text(color = "black", size = 14),
+            axis.title.x = element_text(color = "black", size = 14),
+            axis.title = element_text(size = 14, color = "black"),
+            plot.title = element_text(size = 14, hjust = 0.5),
+            axis.line = element_line(color = "black"),
+            strip.text.x = element_text(size = 14, color = "black"),
+            legend.position = "right",
+            legend.text = element_text(size = 10, color = "black", family = "Helvetica"),
+            legend.title = element_text(size = 10, color = "black", family = "Helvetica", hjust =0))+
+    guides(color = ggplot2::guide_legend(title = "Specifity", order = 1),
+           shape = ggplot2::guide_legend(title = "Direction", order = 2))
+  gg1
+  ggsave(paste0(outputFolder, "analysis/cellchat/Signaling_changes_in_", src_name,"_upon_tcf15ko_LAMININ_COLLAGEN_PTPRM_PECAM1_excluded.pdf"), width = 8, height = 7)
+}
+
+
+
+
+```
+
+## 7.4 Iteraction Circos only Ec's and FB clusters
+```{r}
+pdf(paste0(outputFolder, "analysis/cellchat/InteractionNumber_FB.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          sources.use = c(1,11),
+                          title.name = "Outgoing Interaction FB",
+                          arrow.width = 1,
+                          arrow.size = .5)
+dev.off()
+
+pdf(paste0(outputFolder, "analysis/cellchat/InteractionWeigth_FB.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          sources.use = c(1,11),
+                            title.name = "Interaction weight FB",
+                          arrow.width = 1,
+                          arrow.size = .5,
+                          measure = "weight")
+dev.off()
+
+```
+
+
+```{r}
+pdf(paste0(outputFolder, "analysis/cellchat/InteractionNumber_EC.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          sources.use = c(4),
+                          title.name = "Outgoing Interaction EC",
+                          arrow.width = 1,
+                          arrow.size = .5)
+dev.off()
+
+pdf(paste0(outputFolder, "analysis/cellchat/InteractionWeigth_EC.pdf"))
+netVisual_diffInteraction(CC_merge,
+                          weight.scale = T,
+                          sources.use = c(2,4,8,9,12),
+                          title.name = "Interaction weight EC",
+                          arrow.width = 1,
+                          arrow.size = .5,
+                          measure = "weight")
+dev.off()
+```
+
+
+
+### 7.5 Bubble plot of CapEC's to selected celltypes
+```{r}
+
+#ECs to FB
+  pairLR_all <- CellChatDB.mouse$interaction
+  pairLR_use <- pairLR_all[pairLR_all$interaction_name_2 %in% plot_names,]$pathway_name
+  
+  p<-netVisual_bubble(CC_merge,
+                   sources.use = c("Cap_EC", "End_EC","EC6_ven", "Art_EC"),
+                   targets.use = c("FB"),
+                   comparison = c(1,2),
+                   angle.x = 45,
+                   color.text = DOtools:::umap_colors)
+  
+ggsave(paste0(outputFolder, "analysis/cellchat/LigandReceptor_analysis_AllEcs_to_FB.pdf"), width = 4, height = 3)
+
+#FB to EC's
+  pairLR_all <- CellChatDB.mouse$interaction
+  pairLR_use <- pairLR_all[pairLR_all$interaction_name_2 %in% plot_names,]$pathway_name
+  
+  p<-netVisual_bubble(CC_merge,
+                   sources.use = c("FB"),
+                   targets.use = c("Cap_EC", "End_EC","EC6_ven","FB"),
+                   comparison = c(1,2),
+                   angle.x = 45,
+                   signaling = c()
+                   color.text = DOtools:::umap_colors)
+  
+ggsave(paste0(outputFolder, "analysis/cellchat/LigandReceptor_analysis_FB_to_AllEcs+FB.pdf"), width = 4, height = 7)
+```
+
+## 7.4 Circos plot ArtEC vs rest & CapEC vs rest
+
+```{r}
+par(mfrow = c(1,2), xpd=T)
+levels(CC_merge@idents$joint)
+
+for (i in 1:length(CC_list)) {
+  netVisual_chord_gene(CC_list[[i]],
+                       sources.use = 12,
+                       targets.use = setdiff(1:length(levels(CC_merge@idents$joint)),12),
+                       lab.cex = 0.5, title.name = paste0("Signaling from ArtEC - ", names(CC_list)[i]))
+}
+```
+
+## 7.5 Output Data
+
+```{r}
+int_all <- list()
+for (celltype in unique(c(CC_list$tcf15@idents))) {
+  for (cellchat in CC_list){
+    cellchat <- rankNetPairwise(cellchat)
+    for (i in unique(cellchat@meta$annotation_ref)){
+      name <- paste('from', i,'to',celltype, 'in', unique(cellchat@meta$condition))
+      int <- identifyEnrichedInteractions(cellchat, from = i, to=celltype, bidirection=F)
+      if(nrow(int) != 0){
+        int$name = name
+        int$sender = i
+        int$receiver = celltype
+        print (cellchat@meta$condition)
+        int$condition = unique(cellchat@meta$condition)
+        int$value <- cellchat@net$prob[celltype, i, rownames(int)]
+        int_all[[name]]<-int
+      }
+    }
+    
+    for (j in as.character(unique(cellchat@meta$annotation_ref))[!as.character(unique(cellchat@meta$annotation_ref))==celltype]){
+      name <- paste('from',celltype,  'to', j, 'in', unique(cellchat@meta$condition))
+      if(nrow(int) != 0){
+        int$name = name
+        int$sender = celltype
+        int$receiver = j
+        int$condition = unique(cellchat@meta$condition)
+        int$value <- cellchat@net$prob[j, celltype, rownames(int)]
+        int_all[[name]]<-int
+      }  
+    }
+  }
+}
+Interaction.db <- purrr::reduce(int_all, full_join)
+
+wb <- createWorkbook()
+hs1 <- createStyle(
+  fgFill = '#DCE6F1', halign='CENTER', textDecoration='bold', border='Bottom'
+  )
+
+addWorksheet(wb, 'Interactions_all')
+writeData(wb, sheet='Interactions_all', x=Interaction.db, rowNames=T, headerStyle=hs1)
+saveWorkbook(wb, file=paste0(outputFolder,'Cellchat_interaction_ALL.xlsx'))
+
+
+```
+
+```{r}
+SeuratObject.combined$orig.ident<-factor(SeuratObject.combined$orig.ident, levels=c("Wildtype-1","Wildtype-2","Wildtype-3","Tcf15mutant-1","Tcf15mutant-2","Tcf15mutant-3"))
+p<-DO.Dotplot(object = SeuratObject.combined, Feature = "Tcf15", group.by.x = "orig.ident", group.by.y = "predicted_labels_celltypist")
+ggsave(filename = paste0(outputFolder, "analysis/plots/global/vlnplots/Barplot_Tcf15_global.pdf"), width = 10, height = 15, plot = p, device = "pdf")
+
+```
