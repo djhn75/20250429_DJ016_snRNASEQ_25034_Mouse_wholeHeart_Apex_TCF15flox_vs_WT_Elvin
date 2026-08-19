@@ -469,6 +469,13 @@ FeaturePlot(SeuratObject.combined, features = "Tcf15", label = T, label.size = 4
 ggsave(filename = paste0(outputFolder, "analysis/plots/global/UMAPs/FeaturePlot_Tcf15_global.pdf"), width = 5, height = 5,  device = "pdf")
 ```
 
+```{r}
+
+DO.UMAP(sce_object = SeuratObject.combined, features = "Tcf15", group.by = "annotation", label = TRUE, DensityPlot = TRUE, FeaturePlot = FALSE)
+ggsave(filename = paste0(outputFolder, "analysis/plots/global/UMAPs/DensityPlot_Tcf15_global.pdf"), width = 5, height = 5,  device = "pdf")
+```
+
+
 #### 4.3 Claculate Mesenchmyal score
 
 ```{r}
@@ -709,7 +716,7 @@ mesenchymal_genes2<-c("Serpine1","Mmp9","Snai1", "Postn","Col1a1","Col1a2")
 vascular_genes<-c("Pecam1","Kdr","Ptprb","Spry1","Foxo1","S1pr1","Efna1","Gja4","Cxcr4","Ace","Tgfbr2","Irp5")
 
 #rename Wildtype to Ctrl, so that it apperas first in the dotplot
-Seu.EC_all$condition2<- ifelse(Seu.EC_all$condition=="Wildtype", yes = "Ctrl", no = "Tcf15mutat")
+Seu.EC_all$condition2<- ifelse(Seu.EC_all$condition=="Wildtype", yes = "Control", no = "Tcf15mutat")
 
 
 p<- DO.Dotplot(Seu_object = Seu.EC_all,
@@ -789,6 +796,41 @@ for (celltype in c("Cap_EC", "Art_EC", "EC6_ven", "End_EC")) {
 ```
 
 
+```{r}
+library(ggpubr)
+SeuratObject.combined$condition2<- ifelse(SeuratObject.combined$condition=="Wildtype", yes = "Control", no = "Tcf15mutat")
+mesenchymal_genes1<-c("Fn1","Eln","Mgp","Bgn","Dcn","Col3a1")
+mesenchymal_genes2<-c("Serpine1","Mmp9","Snai1","Postn","Col1a1","Col1a2")
+
+
+
+
+SeuratObject.Ecs<-DO.Subset(SeuratObject.combined, subset = annotation_refined %in% c("Cap_EC", "Art_EC", "EC6_ven", "End_EC"))
+
+
+
+DO.Heatmap(sce_object = SeuratObject.Ecs, features = c(mesenchymal_genes1,mesenchymal_genes2), group_by = "condition", xticks_rotation = 45, title = "EC_all", path = paste0(outputFolder, "analysis/plots/celltype/EC_all"), filename = "heatmap_mesenchymalmarkers_ec_all.pdf", swap_axes = FALSE) 
+
+
+DO.Dotplot(object = SeuratObject.Ecs, Feature = mesenchymal_genes1, group.by.x = "annotation_refined", group.by.y = "condition")
+
+for (celltype in c("Cap_EC", "Art_EC", "EC6_ven", "End_EC")) {
+  Seu.EC_temp <-subset(SeuratObject.combined, subset= annotation_refined == celltype)
+
+  DO.Heatmap(sce_object = Seu.EC_temp, features = c(mesenchymal_genes1,mesenchymal_genes2), group_by = "condition", xticks_rotation = 45, title = celltype, path = paste0(outputFolder, "analysis/plots/celltype/"), filename = paste0("heatmap_mesenchymalmarkers_",celltype,".pdf"), swap_axes = FALSE) 
+
+  #p1<- DO.Dotplot(Seu_object = Seu.EC_temp, Feature = mesenchymal_genes1, group.by.x = "condition2") + ggtitle(paste("Mesenchymal Genes in ", celltype)) + coord_flip()
+   # ggsave(paste0(outputFolder, "analysis/plots/for-paper/Fig3e/dotplot_mesenchymal_genes1_", celltype, "_.pdf"), width = 5, height = 7)
+
+  
+  #p2<- DO.Dotplot(Seu_object = Seu.EC_temp, Feature = mesenchymal_genes2, group.by.x = "condition2") + coord_flip()
+    #ggsave(paste0(outputFolder, "analysis/plots/for-paper/Fig3e/dotplot_mesenchymal_genes2_", celltype, "_.pdf"), width = 5, height = 7)
+
+} 
+
+sub<-subset(SeuratObject.combined, subset= annotation_refined == "Cap_EC")
+DO.Heatmap(sub, features = c("Snai1","Serpine1"), group_by = "condition", xticks_rotation = 45, title = "Cap_EC", path = paste0(outputFolder, "analysis/plots/celltype/"), filename = paste0("heatmap_mesenchymalmarkers_","Cap_EC","_20260617.pdf"), swap_axes = FALSE)
+```
 
 #### 6.2.1.2 Claculate Mesenchmyal score
 
@@ -804,6 +846,111 @@ ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/vlnplots/
 
 #### 6.2.1.3 Split cells based on Mesenchmyal score
 ```{r}
+df <- FetchData(Seu.EC_all, vars = c("mesenchymal_score1", "condition"))
+
+p<-ggplot(df, aes(x = mesenchymal_score1, color = condition, fill = condition)) +
+  geom_density(alpha = 0.25, adjust = 1) +
+  theme_classic()
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/Density_MesenchymalScore_ec_all.pdf"), width = 4, height = 2,  device = "pdf")
+```
+
+
+```{r}
+df <- FetchData(Seu.EC_all, vars = c("mesenchymal_score1", "condition", "orig.ident")) %>%
+  as.data.frame() %>%
+  mutate(
+    score_quantile = ntile(mesenchymal_score1, 10),
+    score_quantile = factor(paste0("Q", score_quantile), levels = paste0("Q", 1:10))
+  )
+
+prop_df <- df %>%
+  count(score_quantile, condition) %>%
+  group_by(score_quantile) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(prop_df, aes(x = score_quantile, y = prop, fill = condition)) +
+  geom_col(position = "stack", color = "black", width = 0.8) +
+  geom_text(
+    aes(label = percent(prop, accuracy = 1)),
+    position = position_stack(vjust = 0.5),
+    size = 3
+  ) +
+  scale_y_continuous(labels = percent_format()) +
+  theme_classic() +
+  labs(x = "Quantile", y = "Proportion", fill = "Condition")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/barplot_proportion_quant10_mesenchymalscore_ec_all.pdf"), width = 4, height = 2,  device = "pdf")
+```
+
+
+```{r}
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+library(hrbrthemes)
+library(viridis)
+
+df <- FetchData(Seu.EC_all, vars = c("mesenchymal_score1", "condition", "orig.ident")) %>%
+  as.data.frame() %>%
+  mutate(
+    score_quantile = ntile(mesenchymal_score1, 10),
+    score_quantile = factor(paste0("Q", score_quantile), levels = paste0("Q", 1:10))
+  )
+
+prop_df <- df %>%
+  count(score_quantile, condition, orig.ident) %>%
+  group_by(score_quantile) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+
+ggplot(prop_df, aes(x = score_quantile, y = prop, fill = condition)) +
+  geom_boxplot() +
+  geom_jitter(color="black", size=1.4, alpha=0.9) +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent_format()) + 
+  labs(x = "Mesenchymal score quantile", y = "Proportion of cells per quantile")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/boxplot_mesenchymalscore_quant10_ec_all_combined.pdf"), width = 5, height = 5,  device = "pdf")
+  
+
+```
+
+
+```{r}
+df <- FetchData(Seu.EC_all, vars = c("mesenchymal_score1", "condition", "orig.ident")) %>%
+  as.data.frame() %>%
+  mutate(
+    score_quantile = ntile(mesenchymal_score1, 4),
+    score_quantile = factor(paste0("Q", score_quantile), levels = paste0("Q", 1:4))
+  )
+
+prop_df <- df %>%
+  count(score_quantile, condition, orig.ident) %>%
+  group_by(score_quantile) %>%
+  mutate(prop = n / sum(n)) %>%
+  ungroup()
+prop_df$condition<-factor(prop_df$condition, levels = c("Wildtype","Tcf15mutant"))
+
+
+ggplot(prop_df, aes(x = score_quantile, y = prop, fill = condition)) +
+  geom_boxplot() +
+  geom_point(position = position_jitterdodge()) +
+  theme_classic() +
+  scale_y_continuous(labels = scales::percent_format()) + 
+  labs(x = "Mesenchymal score quantile", y = "Proportion of cells per quantile")
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/boxplot_mesenchymalscore_quant4_ec_all_combined.pdf"), width = 5, height = 5,  device = "pdf")
+
+Seu.EC_all<-AddMetaData(object = Seu.EC_all, metadata = data.frame(quant4=df$score_quantile, row.names = rownames(df)))
+p<-DO.CellComposition(Seu.EC_all, cluster_column = "quant4", sample_column = "orig.ident", condition_column = "condition", scanpro_plots = TRUE, outputFolder = paste0(outputFolder, "analysis/plots/celltype/EC_all/"))
+p
+ggsave(filename = paste0(outputFolder, "analysis/plots/celltype/EC_all/composition_mesenchymalscore_quant4_ec_all.pdf"), width = 5, height = 8,  device = "pdf")
+```
+
+
+)
+
+```{r}
+hist(Seu.EC_all$mesenchymal_score1, breaks = 2000)
+
 Seu.EC_all$mesenchymal_group <- ifelse(Seu.EC_all$mesenchymal_score1 > 0, "High", "Low")
 p<-DO.CellComposition(Seu.EC_all, cluster_column = "mesenchymal_group", sample_column = "orig.ident", sort_x = c("Wildtype", "Tcf15mutant"))
 p<- ggpubr::annotate_figure(p, bottom = "Mesenchymal Score > 0 = High; Mesenchymal Score < 0 = Low")
