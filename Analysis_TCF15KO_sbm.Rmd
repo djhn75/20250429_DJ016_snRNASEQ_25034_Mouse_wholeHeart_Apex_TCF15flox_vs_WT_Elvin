@@ -1,0 +1,1457 @@
+---
+title: "Analysis for Elvin TCF15KO"
+author: "Mariano Ruz Jurado"
+date: "2024-08-30"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+-##########-
+# -) START DEG analysis with DESEQ2
+
+##0. Load libraries, set sources
+```{r}
+library(ggplot2)
+library(ggfortify)
+library(gtools)
+library(tidyverse)
+library(reshape2)
+library(tibble)
+library(EnhancedVolcano)
+library(openxlsx)
+```
+
+##1. Load in GTF and adjust it fo further analysis
+```{r}
+gtf <- data.table::fread("/mnt/mariano/Genomes_Annotations/human/GRCH38/Homo_sapiens.GRCh38.77.gtf", sep = "\t", blank.lines.skip = T)
+data.table::setnames(gtf, names(gtf), c("chr","source","type", "start", "end", "score", "strand", "phase", "attributes"))
+
+gtf<-gtf[type=="gene"]
+
+extract_attributes <- function(gtf_attributes, att_of_interest){
+  
+  att <- strsplit(gtf_attributes, "; ")
+  att <- gsub("\"", "", unlist(att))
+  if(!is.null(unlist(strsplit(att[grep(att_of_interest, att)], " ")))){
+    return(unlist(strsplit(att[grep(att_of_interest, att)], " "))[2])
+  }else{
+      return(NA)
+    }
+}
+  
+gtf$biotype <- unlist(lapply(gtf$attributes, extract_attributes, "gene_biotype"))
+gtf$gene_id <- unlist(lapply(gtf$attributes, extract_attributes, "gene_id"))
+```
+
+##2. FPKM analysis
+```{r}
+fpkms <- read.table(file = "/mnt/mariano/scStorage/Mariano/forElvin/24063/cuffdiff/genes.read_group_tracking", header = T)
+fpkms <- data.frame(gene=fpkms$tracking_id, condition=fpkms$condition, replicate=fpkms$replicate, fpkm=fpkms$FPKM)
+
+fpkm_unmelt <- reshape2::dcast(fpkms, formula = gene~condition+replicate, fill = "fpkm")
+
+
+#read DEG statistic
+stat<-read.table(file = "/mnt/mariano/scStorage/Mariano/forElvin/24063/cuffdiff/gene_exp.diff", header = T)
+stat$test_id<-NULL
+combinations<-mixedsort(unique(paste(stat$sample_1, stat$sample_2, sep="|")))
+
+outTable<-fpkm_unmelt
+for (comb in combinations) {
+  comb<-unlist(strsplit(comb, split = "|", fixed = T))
+  condTable<-subset(stat,sample_1==comb[1] & sample_2==comb[2])
+  colN<-colnames(condTable)
+  cond=paste(condTable[1,5],condTable[1,4],sep = "/")
+  colnames(condTable)[7:13]=c(paste("Mean",condTable[1,4],sep="_"),
+                              paste("Mean",condTable[1,5],sep="_"),
+                              paste(colN[9],cond,sep="_"),
+                              paste(colN[10],cond,sep="_"),
+                              paste(colN[11],cond,sep="_"),
+                              paste(colN[12],cond,sep="_"),
+                              paste(colN[13],cond,sep="_"))
+  outTable <- cbind(outTable,condTable[,7:13])
+}
+
+outTable2<-add_column(outTable, gene_id=condTable$gene, .after=1, .name_repair = "minimal")
+outTable2$Treshold_above_1 <- as.factor(ifelse(outTable2$Mean_Control > 1|outTable2$Mean_TCF15KO > 1, ">1", "<1"))
+
+data_df <- outTable2[which(outTable2$Treshold_above_1 == ">1"),3:10] # exchange number corresponding to your samples
+
+# Identify non-numeric columns
+non_numeric_cols <- sapply(data_df, function(x) !is.numeric(x))
+
+# Convert non-numeric values to NA
+data_df[non_numeric_cols] <- lapply(data_df[non_numeric_cols], function(x) {
+  as.numeric(as.character(x))
+})
+
+
+pca_result <- prcomp(t(data_df), scale. = T)
+pca_df <- as.data.frame(pca_result$x)
+
+# PCA result is stored in pca_result
+pca_df <- as.data.frame(pca_result$x)
+
+# Subset the columns for PCA1, PCA2
+pca_subset <- pca_df[, c("PC1", "PC2")]
+
+# Calculate variance explained
+var_explained <- (pca_result$sdev^2) / sum(pca_result$sdev^2)
+
+# Create a data frame for groups
+pca_subset$groups <- c(rep("Control", 4), rep("TCF15KO", 4))
+plot(pca_result$x)
+
+
+
+# Plot the panel of PCA plots with colorized points and variance explained
+p<-ggplot(pca_subset, aes(x = PC1, y = PC2, color = groups)) +
+  geom_point(size = 4) +
+  scale_color_manual(values = c("tomato", "royalblue", "forestgreen","gold", "darkred", "darkblue")) + ggtitle("PCA Control, TCF15_OE") +
+  theme(plot.title = element_text(hjust = 0.5))
+p
+ggsave(filename = "/media/Helios_scStorage/Mariano/forElvin/24063/cuffdiff/PCA_CTRL_TCF15KO.pdf", plot = p, width = 6, height = 4)
+```
+
+
+##3. Write DEG lists
+```{r}
+logcolnames <- grep(c("log2"), colnames(outTable2), value = TRUE)
+logcolnames <- grep(c("Control"), logcolnames, value = TRUE)
+
+for (clnames in logcolnames) {
+  conditions_rel <- unlist(strsplit(clnames, "_"))[3]
+  conditions_rel_split <- unlist(strsplit(conditions_rel,  "/"))
+  conditions_rel_split <- c("gene", conditions_rel_split) # include gene column
+  
+  outTable3 <- outTable2[!is.infinite(outTable2[[clnames]]),]
+  outTable3 <- subset(outTable3, outTable3$Treshold_above_1==">1")
+  
+  #remove duplicate gene names
+  outTable3 <- outTable3[!duplicated(outTable3$gene_id),]
+  gtf2<-data.frame(gene=gtf$gene_id, biotype=gtf$biotype)
+  outTable4 <- merge(outTable3, gtf2, by = "gene")
+  
+  result <- Reduce(cbind, lapply(conditions_rel_split, function(condition) {
+    outTable4[, grep(condition, colnames(outTable4), value = TRUE)]
+  }))
+  
+  # Extract relevant entries from conditions_rel_split
+  gene_pattern <- conditions_rel_split[1]
+  condition1 <- conditions_rel_split[2]
+  condition2 <- conditions_rel_split[3]
+
+  # Create a dynamic regex pattern to include only Mean columns without numbers
+  pattern <- paste0("(", gene_pattern, "|", condition1, ".*", condition2, "|", 
+                    condition2, ".*", condition1, "|", condition1, "(_|Mean$)", "|", 
+                    condition2, "(_|Mean$)", "|^Mean_", condition1, "$|^Mean_", condition2, "$)")
+  
+  # Filter the columns using grep
+  filtered_result <- result[, grep(pattern, colnames(result), value = TRUE)]
+  # Remove columns that have a period followed by a number
+  filtered_result <- filtered_result[, !grepl("\\.[0-9]+$", colnames(filtered_result))]
+  
+  #write Excel sheets
+  openxlsx::write.xlsx(filtered_result, file = paste0("/mnt/mariano/scStorage/Mariano/forElvin/24063/cuffdiff/TCF15KO_bulk_seq_human_24063_",condition1,"_",condition2,"_noInf_thresh>1.xlsx"), colNames=T, rowNames=F)
+}
+```
+
+
+# -) END DEG analysis with DESEQ2
+-##########-
+
+# -) Figure 2b
+
+##4. Request_250514 Additional Analysis: Combine GO Terms, provide list of genes
+```{r}
+DEG_DF <- read.xlsx("/mnt/mariano/NGS_storage/Elvin/24063/cuffdiff/TCF15KO_bulk_seq_human_24063_TCF15KO_Control_noInf_thresh>1.xlsx", colNames=T, rowNames=F)
+
+DEG_DF_sig <- DEG_DF[DEG_DF$`significant_TCF15KO/Control` == "yes",] #only significant
+
+DEG_DF_sig <- DEG_DF_sig[abs(DEG_DF_sig$`log2.fold_change._TCF15KO/Control`) >= 0.25, ] # thresh for FC
+
+#divide by pos and negative regulated genes
+positive_DEG_DF <- DEG_DF_sig[DEG_DF_sig$`log2.fold_change._TCF15KO/Control` > 0,]
+negative_DEG_DF <- DEG_DF_sig[DEG_DF_sig$`log2.fold_change._TCF15KO/Control` < 0,]
+
+#read in excel sheet results from metascape
+#up
+GO.UP <- openxlsx::read.xlsx("/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/DEG_UP/metascape_result/metascape_result.up.xlsx",sheet = 2)
+#down
+GO.DOWN <- openxlsx::read.xlsx("/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/DEG_DOWN/metascape_result/metascape_result.down.xlsx",sheet = 2)
+
+#Just summary terms for plot
+GO.UP.Sum <- GO.UP[grepl("Summary",GO.UP$GroupID),]
+GO.DOWN.Sum <- GO.DOWN[grepl("Summary",GO.DOWN$GroupID),]
+
+
+##For GO.UP
+
+#Combine the two rows VEGFA VEGFR2 signaling ith vasculature development
+rows_to_merge <- grepl("VEGFA VEGFR2 signaling", GO.UP.Sum$Description) | grepl("vasculature development", GO.UP.Sum$Description)
+to_merge <- GO.UP.Sum[rows_to_merge, ]
+
+#Create the combined row
+combined_row <- to_merge[1, ]  # start from the first row as template
+combined_row$Description <- "VEGFA VEGFR2 signaling_vasculature development"
+combined_row$Genes <- paste(to_merge$Genes, collapse = ",")
+combined_row$Symbols <- paste(to_merge$Symbols, collapse = ",")
+
+# Remove the original rows and add the new one
+GO.UP.Sum <- GO.UP.Sum[!rows_to_merge, ]
+GO.UP.Sum <- rbind(GO.UP.Sum, combined_row)
+
+##For GO.DOWN
+
+#Combine the two rows VEGFA VEGFR2 signaling ith vasculature development
+rows_to_merge <- grepl("VEGFA VEGFR2 signaling", GO.DOWN.Sum$Description) | grepl("vasculature development", GO.DOWN.Sum$Description)
+to_merge <- GO.DOWN.Sum[rows_to_merge, ]
+
+#Create the combined row
+combined_row <- to_merge[1, ]  # start from the first row as template
+combined_row$Description <- "VEGFA VEGFR2 signaling_vasculature development"
+combined_row$Genes <- paste(to_merge$Genes, collapse = ",")
+combined_row$Symbols <- paste(to_merge$Symbols, collapse = ",")
+
+# Remove the original rows and add the new one
+GO.DOWN.Sum <- GO.DOWN.Sum[!rows_to_merge, ]
+GO.DOWN.Sum <- rbind(GO.DOWN.Sum, combined_row)
+
+
+#Take *-1 to the log10p column, everything positive
+GO.UP.Sum$LogP <- GO.UP.Sum$LogP*(-1)
+GO.UP.Sum$`Log(q-value)` <- GO.UP.Sum$`Log(q-value)`*(-1)
+GO.DOWN.Sum$LogP <- GO.DOWN.Sum$LogP*(-1)
+GO.DOWN.Sum$`Log(q-value)` <- GO.DOWN.Sum$`Log(q-value)`*(-1)
+
+#Add column with avg FC UP
+GO.UP.Sum$avg_FC <- NA
+for (groups in GO.UP.Sum$GroupID) {
+  relev_genes <- unlist(strsplit(GO.UP.Sum[GO.UP.Sum$GroupID == groups,]$Symbols,split = ","))
+  GO.UP.Sum[GO.UP.Sum$GroupID == groups,]$avg_FC <- mean(DEG_DF_sig[DEG_DF_sig$gene_id %in% relev_genes,]$`log2.fold_change._TCF15KO/Control`)
+}
+
+#Add column with avg FC UP
+GO.DOWN.Sum$avg_FC <- NA
+for (groups in GO.DOWN.Sum$GroupID) {
+  relev_genes <- unlist(strsplit(GO.DOWN.Sum[GO.DOWN.Sum$GroupID == groups,]$Symbols,split = ","))
+  GO.DOWN.Sum[GO.DOWN.Sum$GroupID == groups,]$avg_FC <- mean(DEG_DF_sig[DEG_DF_sig$gene_id %in% relev_genes,]$`log2.fold_change._TCF15KO/Control`)
+}
+
+#Comb DF by relevant columns
+GO_TCF15down_Subset <- GO.DOWN.Sum[, c("Description", "Log(q-value)", "avg_FC")]
+GO_TCF15Up_Subset <- GO.UP.Sum[, c("Description", "Log(q-value)", "avg_FC")]
+
+#Add p-values and terms which were also found in the other condition, otherwise dont add them so that in the plot they are just empty spaces
+terms_TCF15 <- GO_TCF15Up_Subset$Description
+GO.DOWN_TCF15 <- GO.DOWN[GO.DOWN$Description %in% terms_TCF15,]
+GO.DOWN_TCF15$avg_FC <- NA
+for (groups in GO.DOWN_TCF15$GroupID) {
+  relev_genes <- unlist(strsplit(GO.DOWN_TCF15[GO.DOWN_TCF15$GroupID == groups,]$Symbols,split = ","))
+  GO.DOWN_TCF15[GO.DOWN_TCF15$GroupID == groups,]$avg_FC <- mean(DEG_DF_sig[DEG_DF_sig$gene_id %in% relev_genes,]$`log2.fold_change._TCF15KO/Control`)
+}
+GO.DOWN_TCF15 <- GO.DOWN_TCF15[, c("Description", "Log(q-value)", "avg_FC")]
+GO.DOWN_TCF15$`Log(q-value)` <- GO.DOWN_TCF15$`Log(q-value)` *-1
+
+#add the ones missing
+GO.DOWN_TCF15_missing <- GO.DOWN_TCF15[!(GO.DOWN_TCF15$Description %in% GO_TCF15down_Subset$Description),]
+GO_TCF15DOWN_final <- rbind(GO_TCF15down_Subset,GO.DOWN_TCF15_missing)
+
+terms_CTRL <- GO_TCF15down_Subset$Description
+GO.UP_CTRL <- GO.UP[GO.UP$Description %in% terms_CTRL,]
+GO.UP_CTRL$avg_FC <- NA
+for (groups in GO.UP_CTRL$GroupID) {
+  relev_genes <- unlist(strsplit(GO.UP_CTRL[GO.UP_CTRL$GroupID == groups,]$Symbols,split = ","))
+  GO.UP_CTRL[GO.UP_CTRL$GroupID == groups,]$avg_FC <- mean(DEG_DF_sig[DEG_DF_sig$gene_id %in% relev_genes,]$`log2.fold_change._TCF15KO/Control`)
+}
+GO.UP_CTRL <- GO.UP_CTRL[, c("Description", "Log(q-value)", "avg_FC")]
+GO.UP_CTRL$`Log(q-value)` <- GO.UP_CTRL$`Log(q-value)` *-1
+
+#add the ones missing
+GO.UP_CTRL_missing <- GO.UP_CTRL[!(GO.UP_CTRL$Description %in% GO_TCF15Up_Subset$Description),]
+GO_TCF15UP_final <- rbind(GO_TCF15Up_Subset,GO.UP_CTRL_missing)
+
+
+#Add information about in which group relevant
+GO_TCF15DOWN_final$Group <- "DEGs Down"
+GO_TCF15UP_final$Group <- "DEGs Up"
+
+#Row-bind the subsets
+GO_DF_Dotplot <- rbind(GO_TCF15UP_final, GO_TCF15DOWN_final)
+
+#some re-naming
+colnames(GO_DF_Dotplot) <- c("Term","p.adj","avg_FC","Group") # q-value is p-value adjusted by BH
+
+#terms to 10
+GO_DF_Dotplot <- GO_DF_Dotplot[order(GO_DF_Dotplot$p.adj, decreasing = T),]
+
+GO_DF_Dotplot.final <- GO_DF_Dotplot %>%
+  group_by(Group) %>%
+  arrange(desc(p.adj)) %>%
+  slice_head(n = 8) %>%
+  ungroup()
+
+GO_DF_Dotplot.final$Term <- factor(GO_DF_Dotplot.final$Term, levels = rev(c(GO_DF_Dotplot.final[GO_DF_Dotplot.final$Group == "DEGs Down",]$Term, GO_DF_Dotplot.final[GO_DF_Dotplot.final$Group == "DEGs Up" & GO_DF_Dotplot.final$Term != "VEGFA VEGFR2 signaling_vasculature development",]$Term)))
+
+pmain <- ggplot2::ggplot(GO_DF_Dotplot.final, ggplot2::aes(x = Group,y = Term)) + ggplot2::theme_bw(base_size = 14) + 
+    ggplot2::xlab("") + ggplot2::ylab("") + ggplot2::labs(title = "GO analysis TCF15KD")+ ggplot2::coord_fixed(clip = "off") + 
+    ggplot2::theme(plot.margin = ggplot2::margin(t = 1, 
+                                                 r = 0,
+                                                 b = 1,
+                                                 l = 0, 
+                                                 unit = "cm"),
+                   axis.text = ggplot2::element_text(color = "black"),
+                   legend.direction = "horizontal",
+                   axis.text.x = element_text(color = "black",angle = 45,hjust = 1, size = 9, family = "Helvetica"),
+                   axis.text.y = element_text(color = "black", size = 9, family = "Helvetica"),
+                   axis.title.x = element_text(color = "black", size = 10, family = "Helvetica"),
+                   axis.title = element_text(size = 10, color = "black", family = "Helvetica"),
+                   plot.title = element_text(size = 10, hjust = 0.5,face="bold", family = "Helvetica"),
+                   plot.subtitle = element_text(size = 10, hjust = 0, family = "Helvetica"),
+                   axis.line = element_line(color = "black"),
+                   strip.text.x = element_text(size = 8, color = "black", family = "Helvetica"),
+                   legend.text = element_text(size = 8, color = "black", family = "Helvetica"),
+                   legend.title = element_text(size = 8, color = "black", family = "Helvetica", hjust =0),
+                   legend.position = "right",
+                   panel.grid.major = element_blank(),
+                   panel.grid.minor = element_blank(),)
+  
+guides.layer <- ggplot2::guides(fill = ggplot2::guide_colorbar(title = "Avg.log2FC",
+                                                               title.position = "top",
+                                                               title.hjust = 0.5,
+                                                               barwidth = unit(3.5,"cm"),
+                                                               barheight = unit(0.5,"cm"),
+                                                               frame.colour = "black",
+                                                               frame.linewidth = 0.3,
+                                                               ticks.colour = "black",
+                                                               order = 2),
+                                size = ggplot2::guide_legend(title = "-Log10p value", 
+                                                             title.position = "top", title.hjust = 0.5, label.position = "bottom", 
+                                                             override.aes = list(color = "black", fill = "grey50"), 
+                                                             keywidth = ggplot2::unit(0.3, "cm"),
+                                                             order = 1))
+
+dot.col = c("#fff5f0","#990000") # TODO change the scalefillgradient to +n in the else part
+gradient_colors <- c(
+    "royalblue4",
+    "#1b699e",
+    "lightsteelblue",
+    "#E1E1E9",
+    "#E4E4EA",
+    "#fff5f0",
+    "#FFEEE4",
+    "#FEC196",
+    "#ea7e1e",
+    "#ED5B41",
+    "firebrick4")
+
+fill.values <- GO_DF_Dotplot.final$avg_FC
+size.value <- GO_DF_Dotplot.final$p.adj
+breaks <- scales::breaks_extended(n=5)(range(fill.values))
+
+if (abs(max(range(fill.values))) > abs(min(range(fill.values)))) {
+  limits <- c(-max(range(fill.values)),max(range(fill.values))) 
+} else{
+  limits <- c(min(range(fill.values)),-min(range(fill.values))) 
+}
+
+breaks <- unique(sort(c(-breaks,breaks), decreasing = F))[seq(1, length(c(-breaks,breaks)), by=2)]
+breaks <- breaks[!is.na(breaks)]
+
+if (max(breaks) > max(limits)) {
+  limits[length(limits)] <- breaks[length(breaks)]
+}
+if (min(breaks) < min(limits)) {
+  limits[1] <- breaks[1]
+}
+
+pmain <- pmain + ggplot2::scale_fill_gradientn(colours = gradient_colors,
+                                               breaks = breaks,
+                                               limits = limits)
+
+
+pmain <- pmain + 
+  ggplot2::geom_point(ggplot2::aes(fill = fill.values,
+                                   size = size.value,
+                                   )
+                      ,
+                      shape = 21,
+                      stroke=0.65) +
+  guides.layer +
+  ggplot2::scale_size(range = c(3,6)) +
+  ggplot2::scale_size_continuous(breaks = pretty(round(as.vector(quantile(size.value))), n =10)[seq(1, 10, by = 2)],
+                                 limits = c(min(size.value)*1.00,max(size.value)*1.05))+
+  theme(panel.spacing = unit(0, "lines")) +
+  ggplot2::scale_fill_gradientn(limits = c(-1,0.52), oob = scales::squish, colors = gradient_colors)
+  
+print(pmain)
+
+ggsave("/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/GO_bubbleplot_TCF15KD_FC_p_adj_combterm.pdf",width = 5.5, height = 5.5)
+write.xlsx(GO_DF_Dotplot.final, file = "/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/DF_GO_bubbleplot_TCF15KD_FC_p_adj_combterm.xlsx")
+
+#save the genes in the combined term
+row_comb_down <- GO.DOWN.Sum[GO.DOWN.Sum$Description == "VEGFA VEGFR2 signaling_vasculature development",]
+write.xlsx(row_comb_down, file = "/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/VEGFA VEGFR2 signaling_vasculature development_term_DOWN_genes.xlsx")
+
+row_comb_up <- GO.UP.Sum[GO.UP.Sum$Description == "VEGFA VEGFR2 signaling_vasculature development",]
+write.xlsx(row_comb_up, file = "/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/VEGFA VEGFR2 signaling_vasculature development_term_UP_genes.xlsx")
+
+```
+
+# -) Figure 2c & Extended Data Figure 3f
+
+##5. Volcano plot
+```{r}
+#
+vasc_term_down <- read.xlsx("/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/VEGFA VEGFR2 signaling_vasculature development_term_DOWN_genes.xlsx")
+vasc_term_up <- read.xlsx("/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/VEGFA VEGFR2 signaling_vasculature development_term_UP_genes.xlsx")
+
+#VEGFA VEGFR2 signaling_vasculature development
+vasc_term <- rbind(vasc_term_down,vasc_term_up)
+vasc_term$Group <- c("DEGs Down", "DEGs Up")
+
+#for elvin save the genes in the term
+vasc_term_save <- vasc_term %>% 
+  dplyr::select(Description, Group, Symbols)
+write.xlsx(vasc_term_save, file = "/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/VEGFA VEGFR2 signaling_vasculature development_term_UP_DOWN_genes.xlsx")
+
+#separate Gene Symbols by respecting the group
+vasc_term_df <- vasc_term %>% 
+  dplyr::select(Group, Symbols) %>%
+  tidyr::separate_rows(Symbols, sep = ",")
+
+vasc_term_df <- vasc_term_df[!duplicated(vasc_term_df$Symbols),]
+
+#Add foldchange to the gene
+DEG_DF <- read.xlsx("/mnt/mariano/NGS_storage/Elvin/24063/cuffdiff/TCF15KO_bulk_seq_human_24063_TCF15KO_Control_noInf_thresh>1.xlsx", colNames=T, rowNames=F)
+DEG_DF_sig <- DEG_DF[DEG_DF$`significant_TCF15KO/Control` == "yes",] #only significant
+DEG_DF_sig <- DEG_DF_sig[abs(DEG_DF_sig$`log2.fold_change._TCF15KO/Control`) >= 0.25, ] # thresh for FC
+
+#Sort out genes which are not found in the RNA-seq
+vasc_term_df <- vasc_term_df[vasc_term_df$Symbols %in% DEG_DF_sig$gene_id,]
+#add fc
+vasc_term_df$log2FC <- DEG_DF_sig[["log2.fold_change._TCF15KO/Control"]][match(vasc_term_df$Symbols,DEG_DF_sig$gene_id)]
+
+vasc_term_df$Mean_TCF15KO <- DEG_DF_sig[["Mean_TCF15KO"]][match(vasc_term_df$Symbols,DEG_DF_sig$gene_id)]
+vasc_term_df$Mean_Control <- DEG_DF_sig[["Mean_Control"]][match(vasc_term_df$Symbols,DEG_DF_sig$gene_id)]
+
+
+DEG_DF$`q_value_TCF15KO/Control`[DEG_DF$`q_value_TCF15KO/Control` < 0.0005] <- 0.0005
+
+p <- EnhancedVolcano(DEG_DF,
+DEG_DF$gene_id,
+selectLab = vasc_term_df[abs(vasc_term_df$log2FC) > 1,]$Symbols,
+x = 'log2.fold_change._TCF15KO/Control',
+y = 'q_value_TCF15KO/Control',
+title = paste0("TCF15KD vs CTRL - Vasculature developing+VEGFA VEGFR2 signaling"),
+subtitle = "",
+pCutoff = 10e-2,
+FCcutoff = 0.5,
+pointSize = 1.5,
+labSize = 3,
+drawConnectors = T,
+boxedLabels = F,
+labFace = "bold",
+#maxoverlapsConnectors = 6,
+max.overlaps = Inf,
+min.segment.length = 0.5,
+typeConnectors = "closed",
+widthConnectors = 0.25,
+gridlines.major = F,
+gridlines.minor = F,
+lengthConnectors = unit(0.007, "npc"),
+colConnectors = "darkgrey",
+ylim = c(0,3.5),
+xlim = c(-3.5, 3.5),
+# colAlpha = 1/2,
+col = c("grey50", "palegreen4", "#1b699e", "#ea6d1e")
+)+   theme(legend.position = "none")
+p
+
+
+ggsave(filename = "/mnt/mariano/NGS_storage/Elvin/24063/GO_analysis/plots/volcano_TCF15KD_VEGFA VEGFR2 signaling_vasculature development.pdf",
+       plot = p, device = "pdf", height = 8, width = 12)
+
+
+
+
+```
+
+#-) Extended Data Figure 1b
+
+##6. Load AMI Timecourse new object
+```{r}
+Seu_AMI <- readRDS("/mnt/mariano/scStorage/DavidR/BioData/LukasT_TimeCourse/Objects/241206_LukasTAMI_scRNA_onlyYoung.rds")
+DO.UMAP(Seu_AMI, group.by = "annotation")
+
+#Tcf15 expression UMAP
+DO.UMAP(Seu_AMI, features = "Tcf15",FeaturePlot = T, group.by = "annotation", repel=T)
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_Tcf15_Expr.pdf"), width = 8, height = 8)
+
+
+Seu_AMI_EC <- DO.Subset(Seu_AMI, ident = "annotation", ident_name = c("CapEC", "EndoEC", "VeinEC", "ArtEC"))
+DO.UMAP(Seu_AMI_EC, features = "Tcf15",FeaturePlot = T, group.by = "annotation", repel=T)
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_ECs_Tcf15_Expr.pdf"), width = 7, height = 7)
+
+#Tcf15 Dotplot
+DO.Dotplot(Seu_AMI_EC,
+           Feature = "Tcf15",
+           group.by.x = "annotation",
+           coord_flip = F)
+
+ggsave(paste0(outputFolder,"/analysis/plots/Dotplot_ECs_Tcf15_Expr.pdf"), width = 5, height = 5)
+
+
+```
+
+###6.1 Reclustering of the subsetted ECs
+
+```{r}
+#redo clustering steps
+Seu_AMI_EC <- NormalizeData(object = Seu_AMI_EC)
+Seu_AMI_EC <- ScaleData(object = Seu_AMI_EC)
+Seu_AMI_EC <- FindNeighbors(object = Seu_AMI_EC, reduction = "integrated.harmony", dims = 1:10)
+Seu_AMI_EC <- FindClusters(Seu_AMI_EC, resolution = 0.3, algorithm = 4, random.seed = 1234)
+Seu_AMI_EC <- RunUMAP(object = Seu_AMI_EC, reduction = "integrated.harmony", dims = 1:10, spread = 5, min.dist = 0.1, reduction.name = "umap")
+
+p1 <- DO.UMAP(Seu_AMI_EC, features = "Tcf15", group.by = "annotation", repel=T, label = T, legend.position = "none", umap_colors = c("#ff7f0e","#1f77b4","#c49c94","tomato2"))
+p1
+p2 <- DO.UMAP(Seu_AMI_EC, features = "Tcf15",FeaturePlot = T, group.by = "annotation", repel=T, min.cutoff="q10", max.cutoff="q90")
+p3 <- DO.UMAP(Seu_AMI_EC, features = "Tcf15",DensityPlot = T, group.by = "annotation", repel=T)
+
+ggpubr::ggarrange(plotlist = list(p1,p2,p3), ncol=3, nrow=1)
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_Recluster_ECs_Tcf15_Expr.svg"), width = 12, height = 5)
+
+DO.UMAP(Seu_AMI_EC, features = "Tcf15",FeaturePlot = T, group.by = "annotation", repel=T, min.cutoff="q10", max.cutoff="q90", legend.position = "right")
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_Recluster_ECs_Tcf15_FeaturePlot.svg"), width = 6, height = 5)
+
+DO.UMAP(Seu_AMI_EC, features = "Tcf15",DensityPlot = T, group.by = "annotation", repel=T, legend.position = "right")
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_Recluster_ECs_Tcf15_DensityPlot.svg"), width = 6, height = 5)
+
+
+```
+
+
+#-) Extended Data Figure 1d
+
+##7. UMAP CTRL.LV with TCF15 expression
+```{r}
+Human_HF_complete <- readRDS("/mnt/mariano/scStorage/Mariano/Human_Mice_Comparison/Seurat_and_R_objects/260402_Human_HF_complete.rds")
+
+Human_HF_CTRLlv <- DO.Subset(Human_HF_complete, ident = "disease", ident_name = "CTRL.LV")
+p1 <- DO.UMAP(Human_HF_CTRLlv, group.by = "annotation", raster=TRUE)
+p2 <- DO.UMAP(Human_HF_CTRLlv, group.by = "annotation", DensityPlot = TRUE, features = "TCF15", raster = FALSE, label = TRUE)
+
+ggpubr::ggarrange(plotlist = list(p1, p2), ncol = 2, nrow = 1)
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_HCA_leftventricle_TCF15_Expr.pdf"), width = 12, height = 5)
+
+DO.UMAP(Human_HF_CTRLlv, group.by = "annotation", DensityPlot = TRUE, features = "TCF15", raster = FALSE, label = TRUE, legend.position = "right")
+ggsave(paste0(outputFolder,"/analysis/plots/UMAP_HCA_leftventricle_TCF15_DensityPlot.pdf"), width = 6, height = 5)
+
+```
+
+
+#-) Extended Figure 1e
+##8. Dotplot CTRL.LV with TCF15 expression
+
+```{r}
+DO.Dotplot(Human_HF_CTRLlv,
+    group.by.x = "annotation",
+    Feature = "TCF15")
+
+ggsave(paste0(outputFolder, "/Dotplot_TCF15_Human_CTRL.svg"), width = 5, height = 6)
+```
+
+
+#-) Extended Data Figure 2a
+
+##9. HCA Analysis
+
+```{r}
+#read data from HCA
+cellxgene <- read.csv(
+  "/mnt/mariano/scStorage/Mariano/forElvin/2026/request_260123_TCF15_various_tissues/HCA_tissue_data/HCA_CELLxGENE_gene_expression_012326.csv",
+  comment.char = "#"
+)
+
+head(cellxgene)
+unique(cellxgene$Tissue)
+
+cellxgene$pct_expressed <- cellxgene$Number.of.Cells.Expressing.Genes / cellxgene$Cell.Count *100
+
+#check the heart endothelial cell expression
+tmp <- cellxgene[cellxgene$Tissue == "heart" & !is.na(cellxgene$Expression),]
+
+# preparing some tissues (data has 53) and cell types (data has 865)
+
+core_tissues <- c(
+  "heart",
+  "lung",
+  "kidney",
+  "liver",
+  "brain",
+
+  "adipose tissue",
+  "musculature"
+
+)
+
+celltype_map <- tibble::tibble(
+  pattern = c(
+    "cardiomyocyte",
+    "fibroblast",
+    "endothelial",
+    "pericyte",
+    "smooth muscle",
+    "macrophage|monocyte",
+    "t cell|t-cell",
+    "b cell|b-cell|plasma",
+    "nk cell",
+    "neutrophil",
+    "dendritic",
+    "epithelial",
+    "stem|progenitor"
+  ),
+  broad_type = c(
+    "Cardiomyocytes",
+    "Fibroblasts",
+    "Endothelial cells",
+    "Pericytes",
+    "Smooth muscle cells",
+    "Myeloid cells",
+    "T cells",
+    "B cells",
+    "NK cells",
+    "Neutrophils",
+    "Dendritic cells",
+    "Epithelial cells",
+    "Progenitor cells"
+  )
+)
+
+
+cellxgene_filt <- cellxgene %>%
+  filter(Tissue %in% core_tissues)
+
+tmp <- cellxgene_filt[
+  grepl(
+    paste(celltype_map$pattern, collapse = "|"),
+    cellxgene_filt$Cell.Type,
+    ignore.case = TRUE
+  ),
+]
+
+#Major Map
+major_map <- list(
+  "Cardiomyocytes" = c("cardiomyocyte"),
+  
+  "Fibroblasts" = c(
+    "fibroblast", "myofibroblast", "stromal", "mesenchymal"
+  ),
+  
+  "Endothelial cells" = c(
+    "endothelial"
+  ),
+  
+  "Pericytes & SMCs" = c(
+    "pericyte", "smooth muscle"
+  ),
+  
+  "Epithelial cells" = c(
+    "epithelial", "goblet", "club", "ciliated", "tuft", "secretory"
+  ),
+  
+  "Myeloid cells" = c(
+    "monocyte", "macrophage", "dendritic", "neutrophil", "mast"
+  ),
+  
+  "Lymphoid cells" = c(
+    "t cell", "b cell", "plasma", "nk"
+  ),
+  
+  "Progenitor / Stem cells" = c(
+    "progenitor", "stem", "precursor"
+  ),
+  
+  "Neuronal / Glial" = c(
+    "neuron", "neural", "glial"
+  ),
+  
+  "Other" = c(".*")
+)
+
+library(stringr)
+
+assign_major_type <- function(ct, mapping) {
+  ct <- tolower(ct)
+  for (grp in names(mapping)) {
+    pattern <- paste(mapping[[grp]], collapse = "|")
+    if (str_detect(ct, pattern)) {
+      return(grp)
+    }
+  }
+  return("Other")
+}
+
+tmp$MajorCellType <- vapply(
+  tmp$Cell.Type,
+  assign_major_type,
+  mapping = major_map,
+  FUN.VALUE = character(1)
+)
+
+tmp %>%
+  dplyr::select(Cell.Type, MajorCellType) %>%
+  distinct() %>%
+  arrange(MajorCellType)
+
+plot_df <- tmp %>%
+  filter(Gene.Symbol == "TCF15") %>%
+  group_by(Tissue, MajorCellType) %>%
+  summarise(
+    mean_expr = mean(Expression, na.rm = TRUE),
+    pct_expr = mean(pct_expressed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_df <- plot_df[complete.cases(plot_df),]
+
+dot.size = c(1, 6)
+midpoint = 0.5
+point_stroke = 0.2
+limits_colorscale = NULL
+nudge_x = 0.3
+nudge_y = 0.2
+exp.title <- "Mean expression in group"
+fill.values <- plot_df$mean_expr
+
+#filter plot_df by the wanted cell types
+plot_df <- plot_df[plot_df$MajorCellType %in% c("Cardiomyocytes", "Endothelial cells", "Fibroblasts", "Pericytes & SMCs"),]
+
+
+library(ggplot2)
+pmain <- ggplot(plot_df, aes(x = MajorCellType, y = Tissue)) +
+  theme_bw(base_size = 14) +
+  ggplot2::xlab("") + ggplot2::ylab("") + ggplot2::coord_fixed(clip = "off") +
+  ggplot2::theme(plot.margin = ggplot2::margin(
+    t = 1,
+    r = 1,
+    b = 1,
+    l = 1,
+    unit = "cm"
+  ),
+    axis.text = ggplot2::element_text(color = "black"),
+    legend.direction = "horizontal",
+    axis.text.x = element_text(
+      color = "black",
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5,
+      size = 14,
+      family = "Helvetica"
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 14,
+      family = "Helvetica"
+    ),
+    axis.title.x = element_text(
+      color = "black",
+      size = 14,
+      family = "Helvetica"
+    ),
+    axis.title = element_text(
+      size = 14,
+      color = "black",
+      family = "Helvetica"
+    ),
+    plot.title = element_text(
+      size = 14,
+      hjust = 0.5,
+      face = "bold",
+      family = "Helvetica"
+    ),
+    plot.subtitle = element_text(
+      size = 14,
+      hjust = 0,
+      family = "Helvetica"
+    ),
+    axis.line = element_line(color = "black"),
+    strip.text.x = element_text(
+      size = 14,
+      color = "black",
+      family = "Helvetica",
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 10,
+      color = "black",
+      family = "Helvetica"
+    ),
+    legend.title = element_text(
+      size = 10,
+      color = "black",
+      family = "Helvetica",
+      hjust = 0
+    ),
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+  )
+guides.layer <- ggplot2::guides(
+  fill = ggplot2::guide_colorbar(
+    title = exp.title,
+    title.position = "top",
+    title.hjust = 0.5,
+    barwidth = unit(3.8, "cm"),
+    barheight = unit(0.5, "cm"),
+    frame.colour = "black",
+    frame.linewidth = 0.3,
+    ticks.colour = "black",
+    order = 2
+  ),
+  size = ggplot2::guide_legend(
+    title = "Fraction of cells \n in group (%)",
+    title.position = "top",
+    title.hjust = 0.5,
+    label.position = "bottom",
+    override.aes = list(color = "black", fill = "grey50"),
+    keywidth = ggplot2::unit(0.5, "cm"),
+    order = 1
+  )
+)
+dot.col <- c("#fff5f0", "#990000")
+gradient_colors <- c("#fff5f0", "#fcbba1", "#fc9272", "#fb6a4a", "#990000")
+
+if (length(dot.col) == 2) {
+  breaks <- (scales::breaks_extended(n = 5))(range(fill.values))
+  if (is.null(limits_colorscale)) {
+    limits_colorscale <- c(min(range(fill.values)) * 
+                             0.99, max(range(fill.values)) * 1.01)
+  }
+  if (max(breaks) > max(limits_colorscale)) {
+    limits_colorscale[length(limits_colorscale)] <- breaks[length(breaks)]
+  }
+  pmain <- pmain + ggplot2::scale_fill_gradientn(colours = gradient_colors, 
+                                                 breaks = breaks, limits = limits_colorscale)
+} else {
+  pmain <- pmain + ggplot2::scale_fill_gradient2(low = dot.col[1], 
+                                                 mid = dot.col[2], high = dot.col[3], midpoint = midpoint, 
+                                                 name = "Gradient")
+}
+
+
+pmain <- pmain +
+  geom_point(aes(fill = mean_expr, size = pct_expr),
+             shape = 21,
+             stroke = point_stroke) +
+  guides.layer +
+  facet_grid(cols = vars("TCF15")) +
+  ggplot2::scale_size(range = c(dot.size[1], dot.size[2]))+
+  theme(panel.spacing = unit(0, "lines"))
+
+ggsave("/mnt/mariano/scStorage/Mariano/forElvin/2026/request_260123_TCF15_various_tissues/HCA_tissue_data/Dotplot_HCA_tissues_major_celltypes_sub.svg", width = 5.5, height = 5.5)
+
+
+
+```
+
+#-) Extended Data Figure 2b
+
+##10. MCA Analysis
+
+```{r}
+#read data from HCA
+cellxgene <- read.csv(
+  "/mnt/mariano/scStorage/Mariano/forElvin/2026/request_260123_TCF15_various_tissues/MCA_tissue_data/MCA_CELLxGENE_gene_expression_012326.csv",
+  comment.char = "#"
+)
+
+head(cellxgene)
+unique(cellxgene$Tissue)
+
+cellxgene$pct_expressed <- cellxgene$Number.of.Cells.Expressing.Genes / cellxgene$Cell.Count *100
+
+#check the heart endothelial cell expression
+tmp <- cellxgene[cellxgene$Tissue == "heart" & !is.na(cellxgene$Expression),]
+
+# preparing some tissues (data has 53) and cell types (data has 865)
+
+core_tissues <- c(
+  "heart",
+  "lung",
+  "kidney",
+  "liver",
+  "brain",
+  "adipose tissue",
+  "musculature"
+
+)
+
+celltype_map <- tibble::tibble(
+  pattern = c(
+    "cardiomyocyte|cardiac muscle cell",
+    "fibroblast",
+    "endothelial",
+    "pericyte",
+    "smooth muscle",
+    "macrophage|monocyte",
+    "t cell|t-cell",
+    "b cell|b-cell|plasma",
+    "nk cell",
+    "neutrophil",
+    "dendritic",
+    "epithelial",
+    "stem|progenitor"
+  ),
+  broad_type = c(
+    "Cardiomyocytes",
+    "Fibroblasts",
+    "Endothelial cells",
+    "Pericytes",
+    "Smooth muscle cells",
+    "Myeloid cells",
+    "T cells",
+    "B cells",
+    "NK cells",
+    "Neutrophils",
+    "Dendritic cells",
+    "Epithelial cells",
+    "Progenitor cells"
+  )
+)
+
+
+cellxgene_filt <- cellxgene %>%
+  filter(Tissue %in% core_tissues)
+
+tmp <- cellxgene_filt[
+  grepl(
+    paste(celltype_map$pattern, collapse = "|"),
+    cellxgene_filt$Cell.Type,
+    ignore.case = TRUE
+  ),
+]
+
+#Major Map
+major_map <- list(
+  "Cardiomyocytes" = c("cardiomyocyte", "cardiac muscle cell"),
+  
+  "Fibroblasts" = c(
+    "fibroblast", "myofibroblast", "stromal", "mesenchymal"
+  ),
+  
+  "Endothelial cells" = c(
+    "endothelial"
+  ),
+  
+  "Pericytes & SMCs" = c(
+    "pericyte", "smooth muscle"
+  ),
+  
+  "Epithelial cells" = c(
+    "epithelial", "goblet", "club", "ciliated", "tuft", "secretory"
+  ),
+  
+  "Myeloid cells" = c(
+    "monocyte", "macrophage", "dendritic", "neutrophil", "mast"
+  ),
+  
+  "Lymphoid cells" = c(
+    "t cell", "b cell", "plasma", "nk"
+  ),
+  
+  "Progenitor / Stem cells" = c(
+    "progenitor", "stem", "precursor"
+  ),
+  
+  "Neuronal / Glial" = c(
+    "neuron", "neural", "glial"
+  ),
+  
+  "Other" = c(".*")
+)
+
+library(stringr)
+
+assign_major_type <- function(ct, mapping) {
+  ct <- tolower(ct)
+  for (grp in names(mapping)) {
+    pattern <- paste(mapping[[grp]], collapse = "|")
+    if (str_detect(ct, pattern)) {
+      return(grp)
+    }
+  }
+  return("Other")
+}
+
+tmp$MajorCellType <- vapply(
+  tmp$Cell.Type,
+  assign_major_type,
+  mapping = major_map,
+  FUN.VALUE = character(1)
+)
+
+tmp %>%
+  select(Cell.Type, MajorCellType) %>%
+  distinct() %>%
+  arrange(MajorCellType)
+
+plot_df <- tmp %>%
+  filter(Gene.Symbol == "Tcf15") %>%
+  group_by(Tissue, MajorCellType) %>%
+  summarise(
+    mean_expr = mean(Expression, na.rm = TRUE),
+    pct_expr = mean(pct_expressed, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+plot_df <- plot_df[complete.cases(plot_df),]
+
+dot.size = c(1, 6)
+midpoint = 0.5
+point_stroke = 0.2
+limits_colorscale = NULL
+nudge_x = 0.3
+nudge_y = 0.2
+exp.title <- "Mean expression in group"
+fill.values <- plot_df$mean_expr
+
+#filter plot_df by the wanted cell types
+plot_df <- plot_df[plot_df$MajorCellType %in% c("Cardiomyocytes", "Endothelial cells", "Fibroblasts", "Pericytes & SMCs"),]
+
+
+library(ggplot2)
+pmain <- ggplot(plot_df, aes(x = MajorCellType, y = Tissue)) +
+  theme_bw(base_size = 14) +
+  ggplot2::xlab("") + ggplot2::ylab("") + ggplot2::coord_fixed(clip = "off") +
+  ggplot2::theme(plot.margin = ggplot2::margin(
+    t = 1,
+    r = 1,
+    b = 1,
+    l = 1,
+    unit = "cm"
+  ),
+    axis.text = ggplot2::element_text(color = "black"),
+    legend.direction = "horizontal",
+    axis.text.x = element_text(
+      color = "black",
+      angle = 90,
+      hjust = 1,
+      vjust = 0.5,
+      size = 14,
+      family = "Helvetica"
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 14,
+      family = "Helvetica"
+    ),
+    axis.title.x = element_text(
+      color = "black",
+      size = 14,
+      family = "Helvetica"
+    ),
+    axis.title = element_text(
+      size = 14,
+      color = "black",
+      family = "Helvetica"
+    ),
+    plot.title = element_text(
+      size = 14,
+      hjust = 0.5,
+      face = "bold",
+      family = "Helvetica"
+    ),
+    plot.subtitle = element_text(
+      size = 14,
+      hjust = 0,
+      family = "Helvetica"
+    ),
+    axis.line = element_line(color = "black"),
+    strip.text.x = element_text(
+      size = 14,
+      color = "black",
+      family = "Helvetica",
+      face = "bold"
+    ),
+    legend.text = element_text(
+      size = 10,
+      color = "black",
+      family = "Helvetica"
+    ),
+    legend.title = element_text(
+      size = 10,
+      color = "black",
+      family = "Helvetica",
+      hjust = 0
+    ),
+    legend.position = "right",
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    
+  )
+guides.layer <- ggplot2::guides(
+  fill = ggplot2::guide_colorbar(
+    title = exp.title,
+    title.position = "top",
+    title.hjust = 0.5,
+    barwidth = unit(3.8, "cm"),
+    barheight = unit(0.5, "cm"),
+    frame.colour = "black",
+    frame.linewidth = 0.3,
+    ticks.colour = "black",
+    order = 2
+  ),
+  size = ggplot2::guide_legend(
+    title = "Fraction of cells \n in group (%)",
+    title.position = "top",
+    title.hjust = 0.5,
+    label.position = "bottom",
+    override.aes = list(color = "black", fill = "grey50"),
+    keywidth = ggplot2::unit(0.5, "cm"),
+    order = 1
+  )
+)
+dot.col <- c("#fff5f0", "#990000")
+gradient_colors <- c("#fff5f0", "#fcbba1", "#fc9272", "#fb6a4a", "#990000")
+
+if (length(dot.col) == 2) {
+  breaks <- (scales::breaks_extended(n = 5))(range(fill.values))
+  if (is.null(limits_colorscale)) {
+    limits_colorscale <- c(min(range(fill.values)) * 
+                             0.99, max(range(fill.values)) * 1.01)
+  }
+  if (max(breaks) > max(limits_colorscale)) {
+    limits_colorscale[length(limits_colorscale)] <- breaks[length(breaks)]
+  }
+  pmain <- pmain + ggplot2::scale_fill_gradientn(colours = gradient_colors, 
+                                                 breaks = breaks, limits = limits_colorscale)
+} else {
+  pmain <- pmain + ggplot2::scale_fill_gradient2(low = dot.col[1], 
+                                                 mid = dot.col[2], high = dot.col[3], midpoint = midpoint, 
+                                                 name = "Gradient")
+}
+
+pmain <- pmain +
+  geom_point(aes(fill = mean_expr, size = pct_expr),
+             shape = 21,
+             stroke = point_stroke) +
+  guides.layer +
+  facet_grid(cols = vars("Tcf15")) +
+  ggplot2::scale_size(range = c(dot.size[1], dot.size[2]))+
+  theme(panel.spacing = unit(0, "lines"))
+
+ggsave("/mnt/mariano/scStorage/Mariano/forElvin/2026/request_260123_TCF15_various_tissues/MCA_tissue_data/Dotplot_MCA_tissues_major_celltypes_sub.svg", width = 5.5, height = 5.5)
+
+```
+
+
+#-) Extended Data Figure 10b & 10d
+
+##11. Tabula muris cell type summary
+```{r}
+
+tm_seu <- readRDS(file = "/mnt/mariano/scStorage/Mariano/forElvin/2026/request_260427_HCA_and_EndMA_marker_analysis/objects/tabula_muris.rds")
+# preparing some tissues (data has 53) and cell types (data has 865)
+tissues_obj <- unique(tm_seu$tissue)
+
+core_tissues <- unique(tm_seu$tissue) # take all available tissues in the object
+
+# available cell types
+ct_objects <- unique(tm_seu$cell_type)
+
+#alternative list
+mapping_table <- tibble::tibble(
+  cell_type = c(
+    # Cardiomyocytes
+    "cardiac muscle cell",
+
+    # Fibroblasts
+    "fibroblast",
+    "fibroblast of cardiac tissue",
+    "fibroblast of lung",
+    "pulmonary interstitial fibroblast",
+
+    # Endothelial cells
+    "endothelial cell",
+    "endothelial cell of coronary artery",
+    "endothelial cell of hepatic sinusoid",
+    "endothelial cell of lymphatic vessel",
+    "vein endothelial cell",
+    "kidney capillary endothelial cell",
+    "fenestrated endothelial cell",
+    "endocardial cell",
+    "kidney cortex artery cell",
+
+    # Pericytes
+    "pericyte",
+
+    # Smooth muscle
+    "smooth muscle cell",
+    "smooth muscle cell of the pulmonary artery",
+    "smooth muscle cell of trachea",
+    "bronchial smooth muscle cell",
+
+    # Myeloid cells
+    "macrophage",
+    "alveolar macrophage",
+    "lung macrophage",
+    "kupffer cell",
+    "monocyte",
+    "classical monocyte",
+    "non-classical monocyte",
+    "intermediate monocyte",
+    "myeloid cell",
+    "myeloid leukocyte",
+    "granulocyte",
+    "granulocytopoietic cell",
+    "promonocyte",
+    "mast cell",
+    "basophil",
+    "professional antigen presenting cell",
+    "macrophage dendritic cell progenitor",
+
+    # T cells
+    "t cell",
+    "naive t cell",
+    "cd4-positive, alpha-beta t cell",
+    "cd8-positive, alpha-beta t cell",
+    "regulatory t cell",
+    "mature nk t cell",
+    "immature nk t cell",
+    "immature t cell",
+    "thymocyte",
+    "dn3 thymocyte",
+    "dn4 thymocyte",
+    "double negative thymocyte",
+
+    # B cells
+    "b cell",
+    "naive b cell",
+    "immature b cell",
+    "precursor b cell",
+    "late pro-b cell",
+    "plasma cell",
+
+    # NK cells
+    "natural killer cell",
+
+    # Neutrophils
+    "neutrophil",
+
+    # Dendritic cells
+    "dendritic cell",
+    "myeloid dendritic cell",
+    "plasmacytoid dendritic cell",
+
+    # Epithelial cells
+    "epithelial cell",
+    "keratinocyte",
+    "keratinocyte stem cell",
+    "basal cell",
+    "basal cell of epidermis",
+    "epidermal cell",
+    "epithelial cell of large intestine",
+    "enterocyte of epithelium of large intestine",
+    "large intestine goblet cell",
+    "intestinal crypt stem cell",
+    "duct epithelial cell",
+    "pancreatic ductal cell",
+    "pancreatic acinar cell",
+    "club cell",
+    "multiciliated columnar cell of tracheobronchial tree",
+    "basal epithelial cell of tracheobronchial tree",
+    "pulmonary alveolar type 2 cell",
+    "pulmonary neuroendocrine cell",
+    "neuroendocrine cell",
+    "tuft cell",
+    "bladder urothelial cell",
+    "bladder cell",
+    "luminal epithelial cell of mammary gland",
+
+    # Progenitor / stem
+    "hematopoietic stem cell",
+    "hematopoietic precursor cell",
+    "erythroid progenitor cell, mammalian",
+    "megakaryocyte-erythroid progenitor cell",
+    "proerythroblast",
+    "erythroblast",
+    "mesenchymal stem cell",
+    "mesenchymal stem cell of adipose tissue",
+    "stem cell of epidermis",
+
+    # Extra (still mapped to closest category)
+    "stromal cell",
+    "mesenchymal cell",
+    "adventitial cell",
+    "hepatic stellate cell",
+    "pancreatic stellate cell",
+    "chondrocyte",
+    "skeletal muscle satellite cell",
+    "cell of skeletal muscle",
+    "schwann cell",
+    "cardiac neuron",
+    "kidney cell",
+    "kidney proximal convoluted tubule epithelial cell",
+    "kidney distal convoluted tubule epithelial cell",
+    "kidney loop of henle ascending limb epithelial cell",
+    "kidney loop of henle thick ascending limb epithelial cell",
+    "kidney collecting duct principal cell",
+    "kidney collecting duct epithelial cell",
+    "kidney proximal straight tubule epithelial cell",
+    "epithelial cell of proximal tubule",
+    "mesangial cell",
+    "hepatocyte",
+    "type b pancreatic cell",
+    "pancreatic a cell",
+    "pancreatic d cell",
+    "pancreatic pp cell",
+    "erythrocyte",
+    "blood cell",
+    "leukocyte",
+    "lymphocyte",
+    "langerhans cell",
+    "plasmatocyte"
+  )
+) %>%
+  mutate(
+    broad_type = case_when(
+      cell_type %in% c("cardiac muscle cell") ~ "Cardiomyocytes",
+
+      grepl("fibroblast", cell_type) ~ "Fibroblasts",
+
+      grepl("endothelial|endocardial", cell_type) ~ "Endothelial cells",
+
+      grepl("smooth muscle|pericyte", cell_type) ~ "Pericytes & SMCs",
+
+      grepl("macrophage|monocyte|myeloid|granul|mast|basophil|kupffer|dendritic|neutrophils", cell_type) ~ "Myeloid cells",
+
+      grepl("t cell|thymocyte|b cell|natural killer", cell_type) ~ "Lymphoid cells",
+
+      grepl("epithelial|keratinocyte|urothelial|enterocyte|duct|acinar|club|alveolar|neuroendocrine|tuft|goblet", cell_type) ~ "Epithelial cells",
+
+      grepl("stem|progenitor|precursor|erythroblast", cell_type) ~ "Progenitor cells",
+
+      TRUE ~ NA_character_
+    )
+)
+
+
+#assign the new annotation
+tm_seu@meta.data <- tm_seu@meta.data %>%
+  left_join(mapping_table, by = "cell_type")
+
+tm_seu$broad_type <- as.character(tm_seu$broad_type)
+table(tm_seu$broad_type, useNA = "ifany")
+
+#subset by only broad annotated assigned cells
+tm_seu_sub <- DO.Subset(tm_seu, ident = "broad_type", ident_name = names(table(tm_seu$broad_type)))
+
+#Cd36, Cav1
+DO.Dotplot(
+    tm_seu_sub,
+    Feature = "Cd36",
+    group.by.x = "broad_type",
+    group.by.y = "tissue",
+    stats_y = FALSE
+)
+
+
+
+tm_seu_sub_pre <- DO.Subset(tm_seu_sub, ident = "tissue", ident_name = tissue_keep)
+
+
+table(tm_seu_sub_pre$broad_type, tm_seu_sub_pre$tissue)
+
+DO.Dotplot(
+    tm_seu_sub_pre,
+    Feature = "Cav1",
+    group.by.x = "broad_type",
+    group.by.y = "tissue",
+    stats_y = FALSE,
+    point_stroke = 0.1
+)
+
+ggsave(paste0(outputFolder, "/analysis/plots/Tabula_muris_Dotplot_Cav1_various_tissues.pdf"), width = 6.5, height = 5.5)
+```
+
+#-) Extended Data Figure 10c & 10e
+
+##12. Recreate UMAP visualisations from Elvin web based
+```{r}
+# Cav1 & Cd36 in heart
+tm_seu_sub_pre_heart <- DO.Subset(tm_seu_sub, ident = "tissue", ident_name = "heart")
+
+tm_seu_sub_pre_heart <- NormalizeData(object = tm_seu_sub_pre_heart)
+tm_seu_sub_pre_heart <- ScaleData(object = tm_seu_sub_pre_heart)
+tm_seu_sub_pre_heart <- FindNeighbors(object = tm_seu_sub_pre_heart, reduction = "PCA", dims = 1:10)
+tm_seu_sub_pre_heart <- FindClusters(tm_seu_sub_pre_heart, resolution = 0.3, algorithm = 4, random.seed = 1234)
+tm_seu_sub_pre_heart <- RunUMAP(object = tm_seu_sub_pre_heart, reduction = "PCA", dims = 1:10, spread = 1, min.dist = 0.3, reduction.name = "umap")
+
+p1 <- DO.UMAP(
+    tm_seu_sub_pre_heart,
+    reduction = "umap",
+    group.by = "broad_type",
+    legend.position = "none"
+)
+ggsave(plot = p1, filename = paste0(outputFolder, "/analysis/plots/UMAP_tabula_muris_heart_celltype.pdf"), width = 6, height = 5)
+p2 <- DO.UMAP(
+    tm_seu_sub_pre_heart,
+    features = "Cd36",
+    DensityPlot = TRUE,
+    reduction = "umap",
+    density_quantile_threshold = 0.75,
+    legend.position = "right"
+)
+ggsave(plot = p2, filename = paste0(outputFolder, "/analysis/plots/UMAP_tabula_muris_heart_Cd36.pdf"), width = 6, height = 5)
+
+p3 <- DO.UMAP(
+    tm_seu_sub_pre_heart,
+    features = "Cav1",
+    DensityPlot = TRUE,
+    reduction = "umap",
+    density_quantile_threshold = 0.75,
+    legend.position = "right"
+)
+ggsave(plot = p3, filename = paste0(outputFolder, "/analysis/plots/UMAP_tabula_muris_heart_Cav1.pdf"), width = 6, height = 5)
+
+# ggpubr::ggarrange(plotlist = list(p1,p2,p3), ncol = 3, nrow = 1)
+
+# Cav1 & Cd36 in limb muscle
+tm_seu_sub_pre_lm <- DO.Subset(tm_seu_sub, ident = "tissue", ident_name = "limb muscle")
+tm_seu_sub_pre_lm <- NormalizeData(object = tm_seu_sub_pre_lm)
+tm_seu_sub_pre_lm <- ScaleData(object = tm_seu_sub_pre_lm)
+tm_seu_sub_pre_lm <- FindNeighbors(object = tm_seu_sub_pre_lm, reduction = "PCA", dims = 1:10)
+tm_seu_sub_pre_lm <- FindClusters(tm_seu_sub_pre_lm, resolution = 0.3, algorithm = 4, random.seed = 1234)
+tm_seu_sub_pre_lm <- RunUMAP(object = tm_seu_sub_pre_lm, reduction = "PCA", dims = 1:10, spread = 1, min.dist = 0.3, reduction.name = "umap")
+
+p1 <- DO.UMAP(
+    tm_seu_sub_pre_lm,
+    reduction = "umap",
+    group.by = "broad_type",
+    legend.position = "none"
+)
+ggsave(plot = p1, filename = paste0(outputFolder, "/analysis/plots/UMAP_tabula_muris_lm_celltype.pdf"), width = 6, height = 5)
+p2 <- DO.UMAP(
+    tm_seu_sub_pre_lm,
+    features = "Cd36",
+    DensityPlot = TRUE,
+    reduction = "umap",
+    density_quantile_threshold = 0.75,
+    legend.position = "right"
+)
+ggsave(plot = p2, filename = paste0(outputFolder, "/analysis/plots/UMAP_tabula_muris_lm_Cd36.pdf"), width = 6, height = 5)
+
+p3 <- DO.UMAP(
+    tm_seu_sub_pre_lm,
+    features = "Cav1",
+    DensityPlot = TRUE,
+    reduction = "umap",
+    density_quantile_threshold = 0.75,
+    legend.position = "right"
+)
+ggsave(plot = p3, filename = paste0(outputFolder, "/analysis/plots/UMAP_tabula_muris_lm_Cav1.pdf"), width = 6, height = 5)
+```
